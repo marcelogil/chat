@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { ConvId, PresenceView } from "@shared/types";
 import type { GroupView } from "@shared/bridge";
 import { CHANNEL_NAME_MAX, normalizeChannelName } from "@shared/channelName";
+import { STATUS_MAX } from "@shared/presenceStatus";
 import { RETENTION, TEAM_CONV } from "@shared/constants";
 import { materializeCalendar, occurrencesInRange, ymd } from "@shared/calendar";
 import { useStore, selfOf } from "@/store";
@@ -19,10 +20,13 @@ import {
 import { useBeamTarget, BeamLabel } from "./beam";
 import { openDm, useDmMap } from "./dm";
 import { countPreTombstonePeers } from "./outdatedPeers";
+import { peopleRows } from "./peopleRows";
+import { PersonLines } from "./PersonLines";
 import { toast } from "./toasts";
 import QuickSwitcher from "./QuickSwitcher";
 import { ConfirmDialog, Dropdown, MenuItem, MenuNote } from "./ChannelMenu";
 import { GroupDialog } from "./GroupDialog";
+import { NotificationsBell, NotificationsPopover } from "./NotificationsPopover";
 
 // Spec §2.2 — the sidebar: quick switcher, channels, DMs (beam drop targets),
 // self footer with status popover. The team block lives in the titlebar row.
@@ -479,6 +483,10 @@ function TeamSection({
   }, [calEvents, today]);
 
   const unseen = prsStatus?.unseen ?? 0;
+  // 1.4: PRs waiting on reviewers past the team's SLA — surfaced here too so
+  // the row hints at it without opening the pane (the badge itself still
+  // counts only unseen-needing-review, unchanged).
+  const overdue = prsStatus?.overdue ?? 0;
 
   // Someone set the group up without sharing their token: this machine polls
   // nothing, so `unseen` stays 0 forever and the row would otherwise be
@@ -523,20 +531,21 @@ function TeamSection({
         icon={<IconGitPull size={13} />}
         active={activeConv === TEAM_CONV.prs}
         title={
-          prsStatus && !prsStatus.configured
+          (prsStatus && !prsStatus.configured
             ? "Pull requests — not connected to Azure DevOps yet"
             : needsToken
               ? "Pull requests — enter your Azure DevOps token to start watching"
               : unseen > 0
                 ? `Pull requests — ${unseen} waiting`
-                : "Pull requests"
+                : "Pull requests") + (overdue > 0 ? ` · ${overdue} overdue` : "")
         }
         ariaLabel={
-          prsStatus && !prsStatus.configured
+          (prsStatus && !prsStatus.configured
             ? "Pull requests, set up needed"
             : needsToken
               ? "Pull requests, your Azure DevOps token is needed"
-              : `Pull requests${unseen > 0 ? `, ${unseen} unseen` : ""}`
+              : `Pull requests${unseen > 0 ? `, ${unseen} unseen` : ""}`) +
+          (overdue > 0 ? `, ${overdue} overdue` : "")
         }
         onClick={() => onOpen(TEAM_CONV.prs)}
         action={{
@@ -560,27 +569,33 @@ function TeamSection({
 
 function DmRow({
   p,
+  label,
   active,
   unread,
 }: {
   p: PresenceView;
+  /** The row's name — `p.name` plus "(previous device)" after a re-join. */
+  label: string;
   active: boolean;
   unread: number;
 }) {
-  const beam = useBeamTarget(p.deviceId, p.name);
+  // A superseded device is listed for its history alone (1.4) — there is
+  // nobody behind it to accept a beam, so the row takes the drag and says so
+  // rather than offering a file to a machine that can never answer.
+  const beam = useBeamTarget(p.deviceId, p.name, !p.supersededBy);
   const offline = p.state === "offline";
   const hasUnread = unread > 0;
   return (
     <button
       className="sem-row"
       onClick={() => void openDm(p.deviceId)}
-      title={`Message ${p.name} (${p.hostname})`}
-      aria-label={`Direct message ${p.name}, ${p.state}${hasUnread ? `, ${unread} unread` : ""}`}
+      title={`Message ${label} (${p.hostname}·${p.fingerprint})${p.status ? ` — ${p.status}` : ""}`}
+      aria-label={`Direct message ${label}, ${p.state}${p.status ? `, status ${p.status}` : ""}${hasUnread ? `, ${unread} unread` : ""}`}
       {...beam.props}
       style={{
         position: "relative",
         width: "100%",
-        height: beam.over ? 44 : 36,
+        height: beam.over ? 52 : 44,
         gap: 8,
         padding: "0 8px",
         borderRadius: "var(--r-sm)",
@@ -595,7 +610,7 @@ function DmRow({
       }}
     >
       {beam.over ? (
-        <BeamLabel name={p.name} />
+        <BeamLabel name={p.name} blocked={beam.blocked} />
       ) : (
         <>
           {active && (
@@ -604,8 +619,8 @@ function DmRow({
               style={{
                 position: "absolute",
                 left: 0,
-                top: 9,
-                bottom: 9,
+                top: 12,
+                bottom: 12,
                 width: 2,
                 borderRadius: 2,
                 background: "var(--accent)",
@@ -618,23 +633,22 @@ function DmRow({
             presence={p.state}
             desaturate={p.state === "away"}
           />
-          <span
-            style={{
-              ...truncate,
-              flex: 1,
-              minWidth: 0,
-              fontSize: 13,
-              fontWeight: hasUnread ? 600 : 400,
-              color: offline && !hasUnread ? "var(--text-3)" : "var(--text-1)",
-              transition: "color var(--t-slow) var(--ease-standard)",
-            }}
-          >
-            {p.name}
-          </span>
-          <DeviceChip
+          {/* Two lines now (1.4): the name, then whatever they said they're
+              doing. The device chip rides the second line and only shows
+              itself on hover/focus — it was the loudest thing in the row and
+              the one people needed least often. */}
+          <PersonLines
+            name={label}
+            status={p.status}
+            state={p.state}
+            departed={p.departed}
             hostname={p.hostname}
             fingerprint={p.fingerprint}
             warn={p.trust === "flagged"}
+            nameWeight={hasUnread ? 600 : 400}
+            nameColor={
+              offline && !hasUnread ? "var(--text-3)" : "var(--text-1)"
+            }
           />
           {hasUnread && <UnreadBadge count={unread} />}
         </>
@@ -922,10 +936,14 @@ function GroupRow({
 function StatusPopover({
   currentStatus,
   appearOffline,
+  hostname,
+  fingerprint,
   onClose,
 }: {
   currentStatus: string;
   appearOffline: boolean;
+  hostname: string;
+  fingerprint: string;
   onClose: () => void;
 }) {
   const [text, setText] = useState(currentStatus);
@@ -979,6 +997,12 @@ function StatusPopover({
           animation: "sem-rise var(--t-base) var(--ease-pop)",
         }}
       >
+        {/* The identity chip used to live in the footer row; it moved here
+            (and into the footer button's title/aria-label) so a long status
+            never has to fight it for width. */}
+        <div style={{ display: "flex", marginBottom: 10 }}>
+          <DeviceChip hostname={hostname} fingerprint={fingerprint} />
+        </div>
         <div
           style={{
             fontSize: 11,
@@ -995,7 +1019,7 @@ function StatusPopover({
           className="sem-input"
           placeholder="What's happening?"
           value={text}
-          maxLength={80}
+          maxLength={STATUS_MAX}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") void save();
@@ -1139,6 +1163,7 @@ export default function Sidebar({
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [statusOpen, setStatusOpen] = useState(false);
+  const [notifyOpen, setNotifyOpen] = useState(false);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const addRef = useRef<HTMLInputElement>(null);
 
@@ -1147,22 +1172,26 @@ export default function Sidebar({
   }, [adding]);
 
   // Departed devices drop off the list — unless they left us something
-  // unread, in which case the row stays until it has been opened.
-  const others = useMemo(() => {
-    const list = presence.filter(
-      (p) =>
-        p.deviceId !== self?.deviceId &&
-        (!p.departed || unreadCount(p.dmConv) > 0),
-    );
-    const rank = { online: 0, away: 1, offline: 2 } as const;
-    list.sort(
-      (a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name),
-    );
-    return list;
+  // unread, in which case the row stays until it has been opened. A device
+  // superseded by a re-join from the same machine (1.4) is stricter still: it
+  // is only ever listed when that DM holds history, and then under
+  // "(previous device)" — see peopleRows.
+  const others = useMemo(
+    () =>
+      peopleRows(presence, self?.deviceId ?? "", {
+        hasHistory: (conv) =>
+          (events[conv] ?? []).some((e) => e.type === "msg"),
+        unread: (conv) => unreadCount(conv),
+      }),
     // events/myReads are what unreadCount reads; listing them keeps the memo honest.
-  }, [presence, self?.deviceId, unreadCount, events, myReads]);
+    [presence, self?.deviceId, unreadCount, events, myReads],
+  );
 
-  const selfPresence = presence.find((p) => p.deviceId === self?.deviceId);
+  // Our own row comes from main's 'self-presence' push (1.4), not from
+  // `presence` — that list is everyone *else* by construction, so looking for
+  // ourselves in it always came back undefined and the footer could never show
+  // the status we had just set.
+  const selfPresence = useStore((s) => s.selfPresence);
 
   async function createChannel() {
     const name = normalizeChannelName(newName);
@@ -1324,10 +1353,11 @@ export default function Sidebar({
         <div style={{ padding: "16px 8px 4px" }}>
           <SectionLabel>Direct messages</SectionLabel>
         </div>
-        {others.map((p) => (
+        {others.map(({ person: p, label }) => (
           <DmRow
             key={p.deviceId}
             p={p}
+            label={label}
             active={activeConv !== null && dmPeers[activeConv] === p.deviceId}
             unread={activeConv === p.dmConv ? 0 : unreadCount(p.dmConv)}
           />
@@ -1356,9 +1386,12 @@ export default function Sidebar({
         >
           <button
             className="sem-row"
-            onClick={() => setStatusOpen((v) => !v)}
-            title="Set your status"
-            aria-label="Set your status"
+            onClick={() => {
+              setNotifyOpen(false);
+              setStatusOpen((v) => !v);
+            }}
+            title={`${selfPresence?.status ? `Status: ${selfPresence.status}` : "Set your status"} — device ${self.hostname} · key fingerprint ${self.fingerprint}`}
+            aria-label={`${selfPresence?.status ? `Your status: ${selfPresence.status}. Change it.` : "Set your status."} Device ${self.hostname}, key fingerprint ${self.fingerprint}.`}
             aria-expanded={statusOpen}
             style={{
               flex: 1,
@@ -1374,45 +1407,27 @@ export default function Sidebar({
               size={28}
               presence={selfPresence?.state ?? "online"}
             />
-            <span style={{ minWidth: 0, flex: 1 }}>
-              <span
-                style={{
-                  ...truncate,
-                  display: "block",
-                  fontSize: 13,
-                  fontWeight: 600,
-                  color: "var(--text-1)",
-                }}
-              >
-                {self.displayName}
-              </span>
-              {/* The device chip gets its own line so a long name never has to give way to it. */}
-              <span
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  minWidth: 0,
-                  marginTop: 2,
-                }}
-              >
-                <DeviceChip
-                  hostname={self.hostname}
-                  fingerprint={self.fingerprint}
-                />
-                <span
-                  style={{
-                    ...truncate,
-                    fontSize: 11,
-                    color: "var(--text-3)",
-                    minWidth: 0,
-                  }}
-                >
-                  {selfPresence?.status || "Set a status"}
-                </span>
-              </span>
-            </span>
+            {/* Name, then the status underneath — the same two lines every
+                person row shows. The device chip stays out of the footer (it
+                is in this button's title/aria-label and in the popover), so
+                nothing here competes with a long status. */}
+            <PersonLines
+              name={self.displayName}
+              status={selfPresence?.status}
+              state={selfPresence?.state ?? "online"}
+              self
+              nameWeight={600}
+            />
           </button>
+          {/* 1.4 — the quick notification controls, next to the gear: the
+              settings people change mid-conversation, without the modal. */}
+          <NotificationsBell
+            open={notifyOpen}
+            onToggle={() => {
+              setStatusOpen(false);
+              setNotifyOpen((v) => !v);
+            }}
+          />
           <button
             className="sem-row sem-focus"
             onClick={onOpenSettings}
@@ -1430,10 +1445,19 @@ export default function Sidebar({
             <IconGear size={16} />
           </button>
 
+          {notifyOpen && (
+            <NotificationsPopover
+              placement="sidebar"
+              onClose={() => setNotifyOpen(false)}
+            />
+          )}
+
           {statusOpen && (
             <StatusPopover
               currentStatus={selfPresence?.status ?? ""}
               appearOffline={selfPresence?.state === "offline"}
+              hostname={self.hostname}
+              fingerprint={self.fingerprint}
               onClose={() => setStatusOpen(false)}
             />
           )}

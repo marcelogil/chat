@@ -13,7 +13,18 @@ import { DangerText } from './steps'
 // profile moved between user accounts, a corrupt seal), or by this user (the
 // passphrase is forgotten, or the team folder was re-created with a new one).
 
-export default function UnlockScreen({ reason }: { reason: 'passphrase' | 'unrecoverable' }) {
+export default function UnlockScreen({
+  reason,
+  notice,
+}: {
+  reason: 'passphrase' | 'unrecoverable'
+  /**
+   * Why the user is looking at this screen instead of where they were —
+   * onboarding refusing to set up over this machine's existing, locked data
+   * (see the store's `unlockNotice`). Null on an ordinary launch.
+   */
+  notice?: string | null
+}) {
   const [forgot, setForgot] = useState(false)
   return (
     <div
@@ -30,11 +41,11 @@ export default function UnlockScreen({ reason }: { reason: 'passphrase' | 'unrec
       <ChromeCss />
       <GradientMesh />
       {reason === 'unrecoverable' ? (
-        <ResetCard cause="unrecoverable" />
+        <ResetCard cause="unrecoverable" notice={notice} />
       ) : forgot ? (
         <ResetCard cause="forgotten" onBack={() => setForgot(false)} />
       ) : (
-        <PassphraseCard onForgot={() => setForgot(true)} />
+        <PassphraseCard onForgot={() => setForgot(true)} notice={notice} />
       )}
     </div>
   )
@@ -84,7 +95,33 @@ const linkStyle = {
   cursor: 'pointer',
 } as const
 
-function PassphraseCard({ onForgot }: { onForgot: () => void }) {
+/**
+ * The "why are you here" strip above a card's own copy. Warning-toned, quiet,
+ * and never a dead end: whatever sent the user here says what to do next.
+ */
+function Notice({ children }: { children: ReactNode }) {
+  return (
+    <div
+      role="status"
+      style={{
+        marginTop: 12,
+        marginBottom: 4,
+        padding: '10px 12px',
+        textAlign: 'left',
+        fontSize: 12,
+        lineHeight: '18px',
+        color: 'var(--text-2)',
+        background: 'color-mix(in srgb, var(--warning) 12%, transparent)',
+        border: '1px solid color-mix(in srgb, var(--warning) 36%, transparent)',
+        borderRadius: 'var(--r-md)',
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+function PassphraseCard({ onForgot, notice }: { onForgot: () => void; notice?: string | null }) {
   const [pass, setPass] = useState('')
   const [busy, setBusy] = useState(false)
   const [fails, setFails] = useState(0)
@@ -119,9 +156,11 @@ function PassphraseCard({ onForgot }: { onForgot: () => void }) {
         <IconLock size={20} />
       </CardIcon>
       <div style={{ fontSize: 22, fontWeight: 600, lineHeight: '28px', color: 'var(--text-1)' }}>Welcome back</div>
-      <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 6, marginBottom: 18 }}>
+      <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 6, marginBottom: notice ? 0 : 18 }}>
         Your messages are encrypted on this computer. Enter the team passphrase to unlock them.
       </div>
+      {notice && <Notice>{notice}</Notice>}
+      {notice && <div style={{ height: 14 }} />}
 
       <input
         ref={inputRef}
@@ -153,10 +192,12 @@ function PassphraseCard({ onForgot }: { onForgot: () => void }) {
           'Unlock'
         )}
       </Button>
-      {fails > 0 && (
+      {/* With a notice up there the reset path is part of what the user was
+          just told to choose from, so it can't wait for a failed attempt. */}
+      {(fails > 0 || !!notice) && (
         <div style={{ marginTop: 14 }}>
           <button type="button" style={linkStyle} onClick={onForgot} disabled={busy}>
-            Forgot it, or the team folder has a new passphrase?
+            {notice ? 'Reset local data — start over as a new device' : 'Forgot it, or the team folder has a new passphrase?'}
           </button>
         </div>
       )}
@@ -164,7 +205,15 @@ function PassphraseCard({ onForgot }: { onForgot: () => void }) {
   )
 }
 
-function ResetCard({ cause, onBack }: { cause: 'unrecoverable' | 'forgotten'; onBack?: () => void }) {
+function ResetCard({
+  cause,
+  onBack,
+  notice,
+}: {
+  cause: 'unrecoverable' | 'forgotten'
+  onBack?: () => void
+  notice?: string | null
+}) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -197,6 +246,11 @@ function ResetCard({ cause, onBack }: { cause: 'unrecoverable' | 'forgotten'; on
         folder and reloads. This computer will appear to teammates as a new device, and direct messages
         sent to the old one can’t be read any more.
       </div>
+      {notice && (
+        <div style={{ marginTop: -6, marginBottom: 14 }}>
+          <Notice>{notice}</Notice>
+        </div>
+      )}
       <Button onClick={() => void reset()} disabled={busy} style={{ width: '100%', height: 34 }}>
         {busy ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>

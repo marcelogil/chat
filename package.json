@@ -1,10 +1,10 @@
 {
   "name": "semaphore",
   "productName": "Chat",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Encrypted team chat over a shared folder — no servers required",
   "main": "out/main/index.js",
-  "author": "Human Blend",
+  "author": "Marcelo Gil",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
@@ -45,5 +45,10 @@
     "vitest": "5.0.0",
     "ws": "8.21.3",
     "zustand": "5.0.15"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marcelogil/chat.git"
+  },
+  "homepage": "https://github.com/marcelogil/chat"
 }

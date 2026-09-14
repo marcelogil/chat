@@ -204,6 +204,63 @@ export interface SettingsView {
   autoAcceptBeams: boolean
   quietHours: { enabled: boolean; from: string; to: string }
   fontSize: 'S' | 'M' | 'L'
+  /** 1.4 — the launch nudge: suggest "open at login" and "allow notifications" until both are accepted. */
+  suggestAtLaunch?: boolean
+  /** 1.4 — set when the person clicked "Turn on notifications" (best effort: the OS prompt cannot be read back). */
+  notificationsAccepted?: boolean
+  /**
+   * 1.4 — pull-request alerts: every tracked pull request, only the ones
+   * waiting on me (next actor, assigned, or mine), or none at all. Never
+   * touches the sidebar badge, which counts rather than interrupts.
+   */
+  notifyPrs?: 'all' | 'mine' | 'none'
+  /**
+   * 1.4 — direct messages and private groups. They ignore `notifyChannels` (you
+   * were invited into them personally), so before this they had no switch at
+   * all; absent means on, which is what every earlier version did.
+   */
+  notifyDms?: boolean
+  /**
+   * 1.4 — "pause everything" as a deadline in ms epoch. Silences every chat and
+   * pull-request alert, OS and in-app, until it passes; null or a time already
+   * gone reads as off. Beam offers are deliberately exempt — they expire
+   * unanswered.
+   */
+  snoozeUntil?: number | null
+  /**
+   * Customized text for the composer's inline quick-reply chip row, one
+   * message per entry in display order. Null or absent means the five
+   * built-in defaults — see `effectiveQuickMessages` in
+   * shared/quickMessages.ts, the one place both the row and the Settings →
+   * Quick messages editor agree on that fallback (and on the per-entry/
+   * list-length limits a save enforces).
+   */
+  quickMessages?: string[] | null
+  /**
+   * 1.4 — the status line under your name ("back at 3"). Plaintext, like every
+   * other setting: it is already public on the share, every teammate's beacon
+   * carries it. Persisted here because the beacon is memory only — before this
+   * a relaunch silently cleared the status you set. Restored into the beacon
+   * at session start (`restoredBeaconPresence`); absent means none.
+   */
+  status?: string
+}
+
+/** What the launch nudge needs to decide whether to show (1.4). */
+export interface LaunchInfo {
+  /** Whether the OS is set to open Chat at login, and whether this build/OS supports asking. */
+  openAtLogin: boolean
+  openAtLoginSupported: boolean
+  /** Whether this launch came from the login item (macOS; always false elsewhere). */
+  openedAtLogin: boolean
+  notificationsSupported: boolean
+  /**
+   * macOS only: what SMAppService says about the item. `requires-approval`
+   * counts as on (`openAtLogin` is true) but still needs a trip to System
+   * Settings, which is the one thing the two launch surfaces say out loud.
+   * Absent on every other platform, and on macOS builds that report nothing.
+   */
+  status?: 'not-registered' | 'enabled' | 'requires-approval' | 'not-found'
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +278,11 @@ export type PushMessage =
   // Window fullscreen state (1.3), from enter/leave-full-screen.
   | { kind: 'fullscreen'; on: boolean }
   | { kind: 'presence'; views: PresenceView[] }
+  // 1.4: this device's own row. `presence.views` is everyone *else* (main
+  // filters the local device out of the roster), which is why the footer's
+  // status was never visible — there was nothing to find. Pushed whenever the
+  // local beacon presence changes; `presence.self()` is the same value pulled.
+  | { kind: 'self-presence'; view: PresenceView }
   | { kind: 'typing'; conv: ConvId; deviceId: string; until: number }
   | { kind: 'cursors'; conv: ConvId; deviceId: string; cursor: CursorView }
   | { kind: 'health'; health: HealthView }
@@ -266,18 +328,32 @@ export interface BridgeApi {
     /** 1.3: OS fullscreen for the main window (the diagram editor's whole-window mode). */
     setFullScreen(on: boolean): Promise<void>
     isFullScreen(): Promise<boolean>
+    /** 1.4: login-item and notification facts for the launch nudge. */
+    launchInfo(): Promise<LaunchInfo>
+    /** 1.4: register/unregister Chat as a login item; resolves the resulting state. */
+    setOpenAtLogin(on: boolean): Promise<{ openAtLogin: boolean }>
+    /** 1.4: show a sample OS notification (triggers the macOS permission prompt on first use). */
+    testNotification(): Promise<void>
   }
 
   onboarding: {
     pickFolder(): Promise<string | null>
     healthCheck(path: string): Promise<OnboardHealth>
     detectDevice(): Promise<{ hostname: string }>
+    /**
+     * `error` is either a sentence to show as-is or the machine-readable code
+     * `'locked-profile'` — this machine already holds sealed local data that
+     * nobody has unlocked, so setting up here would destroy the device
+     * identity in it. `message` carries the sentence for any coded refusal
+     * (additive and optional: older callers that only read `error` still
+     * compile and still show something true).
+     */
     submit(cfg: {
       sharePath: string
       passphrase: string
       displayName: string
       teamName: string
-    }): Promise<{ ok: true } | { ok: false; error: string }>
+    }): Promise<{ ok: true } | { ok: false; error: string; message?: string }>
   }
 
   chat: {
@@ -347,7 +423,10 @@ export interface BridgeApi {
   }
 
   presence: {
+    /** Everyone else on the team folder — never this device (see `self`). */
     list(): Promise<PresenceView[]>
+    /** 1.4: this device's own row, for the footer. Null only before a session exists. */
+    self(): Promise<PresenceView | null>
     setStatus(text: string): Promise<void>
     setAppearState(state: 'online' | 'offline'): Promise<void>
   }
@@ -453,6 +532,9 @@ export interface BridgeApi {
       repos: PrsRepo[]
       token: string
       shareToken: boolean
+      /** 1.4 — team-shared thresholds; omitted = keep the current values (or the defaults). */
+      reviewSlaHours?: number
+      staleAfterDays?: number
     }): Promise<void>
     setPersonalToken(token: string | null): Promise<void>
     /** Publish an empty config and clear 'prs-seen'; keeps the personal token. */

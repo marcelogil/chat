@@ -3,11 +3,15 @@ import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
 import type { ConvId } from '@shared/types'
 import type { SendDraft } from '@shared/bridge'
 import type { MessageView } from '@shared/merge'
+import { quickSendFeedback } from '@shared/quickSendFeedback'
 import { useStore, selfOf } from '@/store'
+import { preferFreshestTwin } from '@/app/twinDevices'
+import { toast } from '@/app/toasts'
 import { Avatar, DeviceChip, IconButton } from '@/ui/atoms'
 import { GifPicker } from '@/content/GifPicker'
 import { DiagramButton } from '@/diagram/DiagramButton'
 import { PollButton } from '@/poll/PollButton'
+import { QuickRepliesRow } from './QuickRepliesRow'
 import { CODE_LANGUAGES, readStoredLang, writeStoredLang } from '@/content/languages'
 import { detectEntities, firstUrlOf, looksLikeCode, snippetOf, withTimeout } from './util'
 import { ClockIcon, CloseIcon, CodeIcon, GifIcon, SendIcon } from './icons'
@@ -133,7 +137,14 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
       out.push({ name: self.displayName, device: self.deviceId })
       seen.add(self.deviceId)
     }
-    for (const p of presence) {
+    // Departed devices are left out on purpose: `detectEntities` binds "@Ana"
+    // to the first roster row with that name and stops, so a stale
+    // registration sharing a name with a live one (the same person re-joined
+    // after a reset — 1.4) would swallow every mention of them and the person
+    // who is actually there would never be notified. `preferFreshestTwin`
+    // covers the seconds before main can prove the stale one is stale
+    // (twinDevices.ts) — the freshest beacon takes the name.
+    for (const p of preferFreshestTwin(presence.filter((x) => !x.departed))) {
       if (!seen.has(p.deviceId) && p.name) {
         out.push({ name: p.name, device: p.deviceId })
         seen.add(p.deviceId)
@@ -152,9 +163,13 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
       ...(self
         ? [{ deviceId: self.deviceId, name: self.displayName, hostname: self.hostname, fingerprint: self.fingerprint }]
         : []),
-      ...presence
-        .filter((p) => !p.departed)
-        .map((p) => ({ deviceId: p.deviceId, name: p.name, hostname: p.hostname, fingerprint: p.fingerprint })),
+      // Same list the mention *binding* reads, for the same reason.
+      ...preferFreshestTwin(presence.filter((p) => !p.departed)).map((p) => ({
+        deviceId: p.deviceId,
+        name: p.name,
+        hostname: p.hostname,
+        fingerprint: p.fingerprint,
+      })),
     ]
     for (const p of people) {
       if (seen.has(p.deviceId) || !p.name) continue
@@ -256,6 +271,63 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
       }
     },
     [text, codeMode, lang, replyTarget, roster, conv, send, onClearReply],
+  )
+
+  // Quick replies (inline chip row above the composer): Option/Alt-click on a
+  // chip inserts its text at the caret — same caret-aware replace-selection
+  // shape as `pick` above, reusing the same `caretAfter` ref so the cursor
+  // lands after the inserted text once the textarea re-renders.
+  const insertQuickMessage = useCallback(
+    (msg: string): void => {
+      const el = taRef.current
+      const start = el ? el.selectionStart : text.length
+      const end = el ? el.selectionEnd : text.length
+      setText(text.slice(0, start) + msg + text.slice(end))
+      caretAfter.current = start + msg.length
+      el?.focus()
+    },
+    [text],
+  )
+
+  // A plain click on a chip: send it immediately as its own text message,
+  // independent of whatever is currently drafted (the draft is left alone).
+  // Mirrors doSend's plain-text branch (entity detection, best-effort link
+  // preview) without touching the reply target — a quick status ping is not a
+  // reply, and it should not clear one that is queued. The typing beacon *is*
+  // cleared, exactly like doSend: typing and then deleting a draft (which is
+  // what brings this row back on screen) leaves the beacon live for 4s, and
+  // teammates should not still see "…is typing" after the reply has landed.
+  const sendQuickMessage = useCallback(
+    async (msg: string): Promise<void> => {
+      const body = msg.trim()
+      if (!body) return
+      if (idleTimer.current !== null) window.clearTimeout(idleTimer.current)
+      typingAt.current = 0
+      void window.bridge.chat.setTyping(null).catch(() => {})
+      const draft: SendDraft = { text: body, kind: 'text' }
+      const entities = detectEntities(body, roster)
+      if (entities.length) draft.entities = entities
+      const url = firstUrlOf(body)
+      if (url) {
+        try {
+          draft.linkPreview = await withTimeout(window.bridge.links.preview(url), 3500)
+        } catch {
+          /* preview is optional — send without it */
+        }
+      }
+      try {
+        await send(conv, draft)
+        setFailed(false)
+      } catch (err) {
+        // The chip's text never went through the textarea, so there is nothing
+        // on screen to retry from — say what happened out loud, and only claim
+        // "queued" when it really was queued (shared/quickSendFeedback.ts).
+        const fb = quickSendFeedback(body, err)
+        if (fb.queued) setFailed(true)
+        toast(fb.text, fb.tone)
+      }
+    },
+    [roster, conv, send],
   )
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -497,6 +569,8 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
           </button>
         </div>
       )}
+
+      <QuickRepliesRow conv={conv} text={text} onInsert={insertQuickMessage} onSendNow={(t) => void sendQuickMessage(t)} />
 
       {/* Input row */}
       <div

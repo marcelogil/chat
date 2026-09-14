@@ -1,21 +1,33 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { SettingsView, ShareStats } from '@shared/bridge'
-import { useStore, selfOf } from '@/store'
-import { Avatar, DeviceChip, Spinner } from '@/ui/atoms'
+import { useStore, selfOf, type SettingsSection } from '@/store'
+import { isSnoozed, prAlertMode, snoozeChoices } from '@shared/notifyDecision'
+import {
+  DEFAULT_QUICK_MESSAGES,
+  QUICK_MESSAGE_LIMITS,
+  effectiveQuickMessages,
+  normalizeQuickMessages,
+} from '@shared/quickMessages'
+import { LOGIN_ITEM_APPROVAL } from './launchNudgeState'
+import { Avatar, DeviceChip, IconButton, Spinner } from '@/ui/atoms'
 import { SectionLabel, Toggle, isMac, truncate } from './chrome'
-import { IconLock } from './icons'
+import { IconArrowUp, IconLock, IconX } from './icons'
 import { toast } from './toasts'
 
 // Spec §2.6 — settings modal, 720×520, left nav.
 
-type Section = 'profile' | 'appearance' | 'notifications' | 'privacy' | 'storage' | 'about'
+// The union lives in the store (1.4): the modal can now be opened straight
+// onto a section from the notifications popover, which has no way to reach
+// this component's own state.
+type Section = SettingsSection
 
 const NAV: { id: Section; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'appearance', label: 'Appearance' },
   { id: 'notifications', label: 'Notifications' },
   { id: 'privacy', label: 'Privacy' },
+  { id: 'quickMessages', label: 'Quick messages' },
   { id: 'storage', label: 'Storage & Share' },
   { id: 'about', label: 'About' },
 ]
@@ -105,13 +117,15 @@ function ToggleRow({
   )
 }
 
-export default function SettingsModal({ onClose }: { onClose: () => void }) {
+export default function SettingsModal({ onClose, section: opensOn }: { onClose: () => void; section?: Section }) {
   const settings = useStore((s) => s.settings)
   const refreshSettings = useStore((s) => s.refreshSettings)
+  const launchInfo = useStore((s) => s.launchInfo)
+  const refreshLaunchInfo = useStore((s) => s.refreshLaunchInfo)
   const health = useStore((s) => s.health)
   const boot = useStore((s) => s.boot)
   const self = selfOf(boot)
-  const [section, setSection] = useState<Section>('profile')
+  const [section, setSection] = useState<Section>(opensOn ?? 'profile')
   const [confirmingFolderChange, setConfirmingFolderChange] = useState(false)
 
   useEffect(() => {
@@ -128,6 +142,28 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
       await refreshSettings()
     } catch {
       toast('Could not save that setting', 'danger')
+    }
+  }
+
+  // 1.4 — these two are OS state, not part of SettingsView, so they go through
+  // app:* rather than settings:set; launchInfo is what LaunchNudge also reads,
+  // so both surfaces agree the moment either one changes it.
+  async function setOpenAtLogin(on: boolean) {
+    try {
+      await window.bridge.app.setOpenAtLogin(on)
+      await refreshLaunchInfo()
+    } catch {
+      toast('Could not change the login item', 'danger')
+    }
+  }
+
+  async function sendTestNotification() {
+    try {
+      await window.bridge.app.testNotification()
+      await refreshSettings() // picks up notificationsAccepted flipping to true
+      toast('Test notification sent', 'success')
+    } catch {
+      toast('Could not send a test notification', 'danger')
     }
   }
 
@@ -295,6 +331,64 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                       onChange={(v) => void patch({ notifyChannels: v })}
                     />
                   </Field>
+                  {/* 1.4 — the same three settings the bell popover writes.
+                      Two views of one state: whichever you change, the other
+                      is already showing it. */}
+                  <ToggleRow
+                    label="Direct messages and private groups"
+                    sub="These ignore the channel setting above — you were invited into them personally."
+                    on={settings.notifyDms !== false}
+                    onChange={(v) => void patch({ notifyDms: v })}
+                  />
+                  <Field
+                    label="Pull request alerts"
+                    hint={
+                      prAlertMode(settings) === 'all'
+                        ? 'New pull requests in every watched repo.'
+                        : prAlertMode(settings) === 'mine'
+                          ? 'Only reviews assigned to you and your own pull requests.'
+                          : 'No pull-request alerts — the badge still counts.'
+                    }
+                  >
+                    <Segmented
+                      label="Notify for pull requests"
+                      value={prAlertMode(settings)}
+                      options={[
+                        { v: 'all' as const, label: 'All' },
+                        { v: 'mine' as const, label: 'Only mine' },
+                        { v: 'none' as const, label: 'Paused' },
+                      ]}
+                      onChange={(v) => void patch({ notifyPrs: v })}
+                    />
+                  </Field>
+                  <Field
+                    label="Pause everything"
+                    hint={
+                      isSnoozed(settings, Date.now())
+                        ? `Paused until ${new Date(settings.snoozeUntil ?? 0).toLocaleString()}. Beam offers still come through — they need an answer.`
+                        : 'Silences every chat and pull-request alert for a while.'
+                    }
+                  >
+                    <Segmented
+                      label="Pause all alerts"
+                      value={
+                        isSnoozed(settings, Date.now())
+                          ? settings.snoozeUntil === snoozeChoices(Date.now()).tomorrow
+                            ? 'tomorrow'
+                            : 'hour'
+                          : 'off'
+                      }
+                      options={[
+                        { v: 'off' as const, label: 'Off' },
+                        { v: 'hour' as const, label: 'For 1 hour' },
+                        { v: 'tomorrow' as const, label: 'Until 9:00 tomorrow' },
+                      ]}
+                      onChange={(v) => {
+                        const { hour, tomorrow } = snoozeChoices(Date.now())
+                        void patch({ snoozeUntil: v === 'off' ? null : v === 'hour' ? hour : tomorrow })
+                      }}
+                    />
+                  </Field>
                   <ToggleRow
                     label="Show message content in notifications"
                     sub="Off shows only who wrote, never what."
@@ -304,7 +398,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                     <ToggleRow
                       label="Quiet hours"
-                      sub="Suppresses OS notifications and badges; the app still updates."
+                      sub="Silences notifications and the pull-request alert between these times; the app still updates, and unread counts still add up."
                       on={settings.quietHours.enabled}
                       onChange={(v) => void patch({ quietHours: { ...settings.quietHours, enabled: v } })}
                     />
@@ -330,6 +424,53 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                       </div>
                     )}
                   </div>
+                  {(launchInfo?.openAtLoginSupported || launchInfo?.notificationsSupported) && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      <SectionLabel>Launch</SectionLabel>
+                      {launchInfo?.openAtLoginSupported && (
+                        <ToggleRow
+                          label="Open Chat when I log in"
+                          sub={
+                            // macOS 13+ can register the item and still hold it
+                            // behind an approval — the toggle is on, and this
+                            // says where the last tick lives (1.4).
+                            launchInfo.status === 'requires-approval'
+                              ? LOGIN_ITEM_APPROVAL
+                              : isMac
+                                ? "You'll still enter the team passphrase after a restart."
+                                : 'Chat opens automatically the next time you sign in.'
+                          }
+                          on={launchInfo.openAtLogin}
+                          onChange={(v) => void setOpenAtLogin(v)}
+                        />
+                      )}
+                      {launchInfo?.notificationsSupported && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                          <span style={{ flex: 1, minWidth: 0 }}>
+                            <span style={{ display: 'block', fontSize: 13, color: 'var(--text-1)' }}>
+                              Notifications
+                            </span>
+                            <span style={{ display: 'block', fontSize: 11, color: 'var(--text-3)', marginTop: 1 }}>
+                              {settings.notificationsAccepted
+                                ? 'Asked on this device.'
+                                : isMac
+                                  ? 'Not confirmed yet — macOS will ask the first time.'
+                                  : 'Not confirmed yet.'}
+                            </span>
+                          </span>
+                          <button className="sem-chip-btn" onClick={() => void sendTestNotification()}>
+                            Send a test notification
+                          </button>
+                        </div>
+                      )}
+                      <ToggleRow
+                        label="Suggest these at launch"
+                        sub="Shows a reminder to turn these on until both are accepted."
+                        on={settings.suggestAtLaunch !== false}
+                        onChange={(v) => void patch({ suggestAtLaunch: v })}
+                      />
+                    </div>
+                  )}
                 </>
               )}
 
@@ -341,6 +482,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   onChange={(v) => void patch({ autoAcceptBeams: v })}
                 />
               )}
+
+              {section === 'quickMessages' && <QuickMessagesSection settings={settings} patch={patch} />}
 
               {section === 'storage' && self && (
                 <>
@@ -510,5 +653,144 @@ function ShareTraffic() {
           : '—'}
       </span>
     </div>
+  )
+}
+
+/**
+ * Settings → Quick messages: the flat, editable list behind the composer's
+ * inline chip row (QuickRepliesRow.tsx). At most `QUICK_MESSAGE_LIMITS.maxEntries`
+ * rows — that's what fits in one line of chips above the composer without
+ * wrapping — in the display order the row renders them.
+ *
+ * `rows` is the source of truth while this section stays mounted: it seeds
+ * once from `settings` and is never resynced from it afterward, so this
+ * component's own save (settings.set → refreshSettings, a round trip through
+ * main) can never fight a keystroke that landed a moment later. A row commits
+ * on blur, not on every keystroke, for the same reason — typing stays purely
+ * local until the field is left. Structural edits (add/remove/reorder/reset)
+ * commit immediately, same as every toggle elsewhere in this modal.
+ */
+function QuickMessagesSection({
+  settings,
+  patch,
+}: {
+  settings: SettingsView
+  patch: (p: Partial<SettingsView>) => Promise<void>
+}) {
+  // Seed through `effectiveQuickMessages`, the same read the chip row uses:
+  // a stale profile with more than `maxEntries` rows (or blank/over-long ones)
+  // then opens this editor already showing exactly what is on screen above the
+  // composer, instead of a longer list whose tail "+ Add message" refuses to
+  // grow and whose first blur silently drops the overflow.
+  const [rows, setRows] = useState<string[]>(() => effectiveQuickMessages(settings))
+  const inputRefs = useRef<(HTMLInputElement | null)[]>([])
+  const focusLast = useRef(false)
+
+  useEffect(() => {
+    if (!focusLast.current) return
+    focusLast.current = false
+    inputRefs.current[rows.length - 1]?.focus()
+  }, [rows.length])
+
+  // An empty save is indistinguishable from "never customized" the moment it
+  // round-trips through settings (effectiveQuickMessages treats null/absent
+  // and [] the same, so the chip row would fall back to the defaults either
+  // way) — so treat clearing the last row exactly like Reset, including in
+  // what this editor shows, rather than leaving a dead empty list on screen
+  // while the row quietly shows the five defaults behind it.
+  function commit(next: string[]): void {
+    const normalized = normalizeQuickMessages(next)
+    if (normalized.length === 0) {
+      setRows(DEFAULT_QUICK_MESSAGES)
+      void patch({ quickMessages: null })
+      return
+    }
+    setRows(normalized)
+    void patch({ quickMessages: normalized })
+  }
+
+  function edit(i: number, value: string): void {
+    setRows((prev) => prev.map((r, idx) => (idx === i ? value : r)))
+  }
+
+  function removeRow(i: number): void {
+    commit(rows.filter((_, idx) => idx !== i))
+  }
+
+  function moveRow(i: number, dir: -1 | 1): void {
+    const j = i + dir
+    if (j < 0 || j >= rows.length) return
+    const next = [...rows]
+    ;[next[i], next[j]] = [next[j], next[i]]
+    commit(next)
+  }
+
+  function addRow(): void {
+    if (rows.length >= QUICK_MESSAGE_LIMITS.maxEntries) return
+    focusLast.current = true
+    setRows((prev) => [...prev, ''])
+  }
+
+  function resetToDefaults(): void {
+    setRows(DEFAULT_QUICK_MESSAGES)
+    void patch({ quickMessages: null })
+  }
+
+  return (
+    <>
+      <Field
+        label="Quick messages"
+        hint={`Shown as a row of chips above the composer — click one to send it right away, ⌥-click to insert it instead. One per line, up to ${QUICK_MESSAGE_LIMITS.maxEntries} messages and ${QUICK_MESSAGE_LIMITS.maxChars} characters each; blank lines are dropped.`}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {rows.map((row, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <input
+                ref={(el) => {
+                  inputRefs.current[i] = el
+                }}
+                className="sem-input"
+                value={row}
+                maxLength={QUICK_MESSAGE_LIMITS.maxChars}
+                aria-label={`Quick message ${i + 1}`}
+                onChange={(e) => edit(i, e.target.value)}
+                onBlur={() => commit(rows)}
+                style={{ flex: 1, minWidth: 0 }}
+              />
+              <span style={{ opacity: i === 0 ? 0.35 : 1, pointerEvents: i === 0 ? 'none' : undefined }}>
+                <IconButton label="Move up" size={24} onClick={() => moveRow(i, -1)}>
+                  <span aria-hidden style={{ display: 'inline-flex' }}>
+                    <IconArrowUp size={12} />
+                  </span>
+                </IconButton>
+              </span>
+              <span style={{ opacity: i === rows.length - 1 ? 0.35 : 1, pointerEvents: i === rows.length - 1 ? 'none' : undefined }}>
+                <IconButton label="Move down" size={24} onClick={() => moveRow(i, 1)}>
+                  <span aria-hidden style={{ display: 'inline-flex', transform: 'rotate(180deg)' }}>
+                    <IconArrowUp size={12} />
+                  </span>
+                </IconButton>
+              </span>
+              <IconButton label="Remove this quick message" size={24} onClick={() => removeRow(i)}>
+                <IconX size={12} />
+              </IconButton>
+            </div>
+          ))}
+        </div>
+      </Field>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          className="sem-chip-btn"
+          onClick={addRow}
+          disabled={rows.length >= QUICK_MESSAGE_LIMITS.maxEntries}
+          style={{ opacity: rows.length >= QUICK_MESSAGE_LIMITS.maxEntries ? 0.5 : 1 }}
+        >
+          + Add message
+        </button>
+        <button className="sem-chip-btn" onClick={resetToDefaults}>
+          Reset to defaults
+        </button>
+      </div>
+    </>
   )
 }

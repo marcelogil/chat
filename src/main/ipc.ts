@@ -1,9 +1,11 @@
-import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, Notification, shell } from 'electron'
 import type { ConvId, EventPayload } from '@shared/types'
-import type { PushMessage, SendDraft, SettingsView, ShareStats } from '@shared/bridge'
+import type { LaunchInfo, PushMessage, SendDraft, SettingsView, ShareStats } from '@shared/bridge'
 import { DIR } from '@shared/constants'
+import { normalizeStatus } from '@shared/presenceStatus'
 import { redactEventForRenderer, redactPushForRenderer } from '@shared/prs'
 import { AppController, detectDevice } from './appController'
+import { launchInfoFrom, loginItemOptions } from './loginItem'
 import { fetchLinkPreview } from './services/linkPreview'
 import { registerBoardsIpc } from './services/boardsIpc'
 import { registerCalendarIpc } from './services/calendarIpc'
@@ -83,6 +85,47 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:renameChannel', (_e, conv: ConvId, name: string) => chat().renameChannel(conv, name))
   ipcMain.handle('chat:deleteChannel', (_e, conv: ConvId) => chat().deleteChannel(conv))
 
+  // 1.4 — the launch nudge: OS facts LaunchNudge.tsx / SettingsModal need, plus
+  // the two actions behind their "Turn on" buttons and toggles.
+  ipcMain.handle('app:launchInfo', (): LaunchInfo => {
+    // Read with exactly the options the item was written with (loginItem.ts):
+    // on Windows a mismatched path/args makes getLoginItemSettings answer
+    // `false` about an entry that is really there.
+    const login = app.getLoginItemSettings(loginItemOptions(process.platform))
+    return {
+      ...launchInfoFrom(login, process.platform),
+      notificationsSupported: Notification.isSupported(),
+    }
+  })
+  ipcMain.handle('app:setOpenAtLogin', (_e, on: boolean): { openAtLogin: boolean } => {
+    // Windows note: this points the login item at process.execPath, wherever
+    // this zip happens to be extracted right now (there is no installer to
+    // register a stable path). If someone later moves that folder, Windows
+    // will fail to find the target — the entry effectively goes stale — but
+    // nothing here needs to detect that specially: app:launchInfo always
+    // re-reads the live OS state, so openAtLogin just reports false again and
+    // the launch nudge comes back on its own.
+    app.setLoginItemSettings({ openAtLogin: on, ...loginItemOptions(process.platform) })
+    // macOS 13+ can silently refuse this (System Settings → General → Login
+    // Items) — read the state back rather than trust `on` took effect, so the
+    // nudge and the Settings toggle both report what actually happened.
+    // `requires-approval` counts as on: the item exists, it just needs a tick.
+    const after = app.getLoginItemSettings(loginItemOptions(process.platform))
+    return { openAtLogin: launchInfoFrom(after, process.platform).openAtLogin }
+  })
+  ipcMain.handle('app:testNotification', () => {
+    // Guarded like maybeNotify/notify (chatService.ts, prService.ts): no point
+    // claiming "accepted" for a toast that was never actually attempted.
+    if (!Notification.isSupported()) return
+    new Notification({
+      title: 'Chat notifications are on',
+      body: 'You will hear about mentions, direct messages and pull requests here.',
+    }).show()
+    // Best effort — neither Electron nor the OS hands back whether the person
+    // actually clicked Allow, so "accepted" here means "we asked."
+    controller.setSettings({ notificationsAccepted: true })
+  })
+
   // 1.3: every stub registered here has been replaced by its owning service,
   // so there is no `not-implemented` fallback left to hand the renderer.
   // Polls (1.3). Both re-validate everything the renderer checked: the option
@@ -136,9 +179,23 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
 
   // Presence
   ipcMain.handle('presence:list', () => chat().poller.presenceViews())
-  ipcMain.handle('presence:setStatus', (_e, text: string) => chat().beacon.setPresence({ status: text }))
+  // This device's own row (1.4) — the poller's list is everyone else. Unlike
+  // the rest of this file's handlers, `chat()`'s `not-ready` throw is wrong
+  // here: the bridge promises `Promise<PresenceView | null>`, "null only
+  // before a session exists" — callers (the footer, `loadTeam`) expect a
+  // quiet null while unlocking, not a rejection to catch.
+  ipcMain.handle('presence:self', () => controller.chat?.selfPresence() ?? null)
+  ipcMain.handle('presence:setStatus', (_e, text: string) => {
+    const svc = chat()
+    const status = normalizeStatus(text)
+    // Settings first: the beacon is memory only, so without this a relaunch
+    // quietly cleared the status. Plaintext is the right place — the same
+    // string is already public in every beacon this device writes.
+    controller.setSettings({ status })
+    svc.setOwnPresence({ status })
+  })
   ipcMain.handle('presence:setAppearState', (_e, state: 'online' | 'offline') =>
-    chat().beacon.setPresence({ state }),
+    chat().setOwnPresence({ state }),
   )
 
   // Roster

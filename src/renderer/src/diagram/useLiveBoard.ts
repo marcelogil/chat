@@ -5,6 +5,7 @@ import type { OrderedExcalidrawElement } from '@excalidraw/excalidraw/element/ty
 import type { BoardFrameDraft, ConvId } from '@shared/types'
 import { BOARD } from '@shared/constants'
 import { onBoardPush, useStore } from '@/store'
+import type { LiveSyncStats } from './liveStatus'
 import { sceneSignature } from './scene'
 import {
   digestFrames,
@@ -92,6 +93,13 @@ export interface LiveBoard {
    * guest who only watched must not be handed a draft-loss confirm on close.
    */
   isRemoteEcho: (signature: string) => boolean
+  /**
+   * What the Live pill says about the traffic (1.4). Read from refs on a
+   * one-second tick in the pill rather than pushed through state: a board being
+   * drawn on writes several frames a second, and re-rendering the whole editor
+   * header that often to move a word is not worth a frame of canvas latency.
+   */
+  syncStats: () => LiveSyncStats
 }
 
 export function useLiveBoard(opts: {
@@ -108,6 +116,9 @@ export function useLiveBoard(opts: {
   // already trusts wins where it knows the device: a display name is how people
   // are told apart on the board, and it is not a field worth taking on trust.
   const presence = useStore((s) => s.presence)
+  // Is the share answering at all? The pill says "Reconnecting…" on this
+  // directly — a board cannot be in sync over a folder that is not there.
+  const reachable = useStore((s) => s.health.reachable)
 
   const [session, setSession] = useState<LiveSession | null>(null)
   const [ended, setEnded] = useState(false)
@@ -132,6 +143,15 @@ export function useLiveBoard(opts: {
   /** `frame-too-large` is one notice per session, not one per second. */
   const tooLargeSaid = useRef(false)
   const participantsRef = useRef<ParticipantMap>({})
+
+  // ---- What the pill reports (1.4). Refs, not state: see `syncStats` below.
+  /** `Date.now()` when main last *accepted* a write of ours. */
+  const sentAt = useRef(0)
+  /** `Date.now()` when a peer's frame was last applied to this canvas. */
+  const recvAt = useRef(0)
+  /** Writes started but not yet settled, and when the oldest of them began. */
+  const inFlight = useRef(0)
+  const pendingSince = useRef<number | null>(null)
 
   const setSessionBoth = useCallback((s: LiveSession | null) => {
     sessionRef.current = s
@@ -182,9 +202,20 @@ export function useLiveBoard(opts: {
         const fresh = selectNewFiles(files.current, api.getFiles() as unknown as Record<string, unknown>, now)
         if (fresh) draft.files = fresh
       }
+      // "Sending…" in the pill is exactly this: a write main has not answered
+      // yet. Counted rather than flagged, because pointer frames and scene
+      // frames overlap freely.
+      inFlight.current += 1
+      if (pendingSince.current === null) pendingSince.current = now
+      const settled = (): void => {
+        inFlight.current = Math.max(0, inFlight.current - 1)
+        if (inFlight.current === 0) pendingSince.current = null
+      }
       void window.bridge.boards
         .write(live.sessionId, conv, draft as BoardFrameDraft)
         .then((res: unknown) => {
+          // Accepted by main — the folder is answering.
+          sentAt.current = Date.now()
           // Files main had to drop to fit `BOARD.maxFrameBytes` never reached
           // the share: put them back in the outgoing set rather than letting
           // the element that needs them be a blank on every peer's canvas.
@@ -201,6 +232,7 @@ export function useLiveBoard(opts: {
             flash('That scene is too big to share live — the others keep the last frame that fitted')
           } else if (msg.includes('not-implemented')) flash('Live boards land in the next build')
         })
+        .finally(settled)
     },
     [apiRef, conv, flash, goLocal],
   )
@@ -256,6 +288,10 @@ export function useLiveBoard(opts: {
       const api = apiRef.current
       if (!api) return
       const now = Date.now()
+      // Anything at all coming back means the poll is alive — the pill's
+      // "Reconnecting…" is the absence of this for longer than a keepalive
+      // round (liveStatus.ts).
+      if (incoming.length > 0) recvAt.current = now
       const digest = digestFrames(incoming, { selfDevice, participants: participantsRef.current, now })
 
       if (digest.batches.length > 0) {
@@ -505,6 +541,21 @@ export function useLiveBoard(opts: {
 
   const isRemoteEcho = useCallback((signature: string) => signature !== '' && signature === remoteSig.current, [])
 
+  // Read through a ref so `syncStats` can stay identity-stable while still
+  // seeing the current value (the pill calls it on its own tick).
+  const reachableRef = useRef(reachable)
+  reachableRef.current = reachable
+  const syncStats = useCallback(
+    (): LiveSyncStats => ({
+      sentAt: sentAt.current,
+      recvAt: recvAt.current,
+      pendingSince: pendingSince.current,
+      peers: Object.keys(participantsRef.current).length,
+      reachable: reachableRef.current,
+    }),
+    [],
+  )
+
   return {
     session,
     ended,
@@ -516,5 +567,6 @@ export function useLiveBoard(opts: {
     onSceneChange,
     onPointerUpdate,
     isRemoteEcho,
+    syncStats,
   }
 }

@@ -11,6 +11,7 @@ import {
   type AdoPullRequest,
 } from './prs'
 import type { ConvId, GroupInviteData, GrpPayload, PrView, PrsConfig, PrsPayload, VerifiedEvent } from './types'
+import { PRS } from './constants'
 
 type Reviewer = PrView['reviewers'][number]
 
@@ -58,11 +59,14 @@ describe('isTracked', () => {
     expect(isTracked(open)).toBe(true)
   })
 
-  it('drops drafts, non-active states and approved PRs', () => {
+  it('drops drafts and non-active states', () => {
     expect(isTracked({ ...open, isDraft: true })).toBe(false)
     expect(isTracked({ ...open, status: 'completed' })).toBe(false)
     expect(isTracked({ ...open, status: 'abandoned' })).toBe(false)
-    expect(isTracked({ ...open, reviewers: [rev(10)] })).toBe(false)
+  })
+
+  it('keeps an approved PR (1.4: "Ready to complete", but never in the badge)', () => {
+    expect(isTracked({ ...open, reviewers: [rev(10)] })).toBe(true)
   })
 })
 
@@ -211,6 +215,44 @@ describe('materializePrsConfig', () => {
   it('normalizes the base URL off the share instead of trusting it verbatim', () => {
     const ev = prsEvent({ t: 'prs', conv: CONV, config: config({ baseUrl: ' https://dev.azure.com/acme/?x=1 ' }) })
     expect(materializePrsConfig([ev])!.config.baseUrl).toBe('https://dev.azure.com/acme')
+  })
+
+  it('carries the team thresholds forward across a snapshot that does not carry them', () => {
+    // A 1.3 client cannot see these fields, so re-publishing the config (to
+    // rename a repo, say) must not read as "go back to 48 h / 14 d" for the
+    // whole team. Only a log where nobody ever set them falls through to the
+    // defaults.
+    const agreed = prsEvent({
+      t: 'prs',
+      conv: CONV,
+      config: config({ reviewSlaHours: 8, staleAfterDays: 3 }),
+    })
+    const from13 = prsEvent({ t: 'prs', conv: CONV, config: config({ repos: [{ id: 'repo-1', name: 'Renamed' }] }) })
+    expect(materializePrsConfig([agreed])!.config.reviewSlaHours).toBe(8)
+    const after = materializePrsConfig([agreed, from13])!.config
+    expect(after.repos).toEqual([{ id: 'repo-1', name: 'Renamed' }])
+    expect([after.reviewSlaHours, after.staleAfterDays]).toEqual([8, 3])
+  })
+
+  it('clamps a threshold off the share to the default rather than dropping the config', () => {
+    // The read path is deliberately the opposite of saveConfig's: one strange
+    // number in a snapshot must never cost the team its base URL and repos.
+    for (const reviewSlaHours of [0, 721, '48', 48.4, undefined]) {
+      const ev = prsEvent({
+        t: 'prs',
+        conv: CONV,
+        config: config({ reviewSlaHours } as Partial<PrsConfig>),
+      })
+      const got = materializePrsConfig([ev])!.config
+      expect(got.baseUrl).toBe('https://dev.azure.com/acme')
+      expect(got.reviewSlaHours).toBe(PRS.reviewSlaHours)
+      expect(got.staleAfterDays).toBe(PRS.staleAfterDays)
+    }
+  })
+
+  it('keeps a threshold inside the range exactly as published', () => {
+    const ev = prsEvent({ t: 'prs', conv: CONV, config: config({ staleAfterDays: 3 }) })
+    expect(materializePrsConfig([ev])!.config.staleAfterDays).toBe(3)
   })
 
   it('drops a snapshot whose base URL is not a usable http(s) address', () => {

@@ -155,6 +155,28 @@ export class Session {
     }
   }
 
+  /**
+   * Load one channel by its id, without listing the channels directory: the
+   * token is `convToken(kMeta, channelId)`, so a conv id we were handed is
+   * enough to find (and verify) its metadata in a single read.
+   *
+   * This is what closes the discovery window (1.4): a channel reaches the
+   * sidebar the moment a beacon head or a sys event names it, but the session
+   * only *loads* channels on the poller's blanket sweep (1–10 minutes), so a
+   * send in between had nothing to encrypt against and was rejected with
+   * "unknown conversation" — the "Say hello does nothing" report. A channel
+   * already in the map is returned as it stands, tombstone included: a deleted
+   * channel must stay closed for writing (see `convInfo`), and re-reading its
+   * metadata would only hand back a state with no tombstone folded into it.
+   */
+  async ensureChannel(conv: ConvId): Promise<ChannelState | null> {
+    if (!isChanConv(conv)) return null
+    const channelId = conv.slice(5)
+    const known = this.channels.get(channelId)
+    if (known) return known
+    return await this.loadChannel(convToken(this.keys.kMeta, channelId))
+  }
+
   private async loadChannel(token: string): Promise<ChannelState | null> {
     const rel = `${DIR.channels}/${token}/channel.json${FILE_EXT.record}`
     const buf = await this.io.readMaybe(rel)

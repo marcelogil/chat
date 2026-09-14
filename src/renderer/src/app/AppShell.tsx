@@ -20,6 +20,7 @@ import { NoConvState, EmptyConvOverlay } from './EmptyStates'
 import { ActiveShareBanner, ScreenShareRoot } from '@/screenshare/ShareUi'
 import { BeamSurface } from './BeamSurface'
 import { UpdateBanner } from './UpdateBanner'
+import { LaunchNudge } from './LaunchNudge'
 
 // The main three-pane application shell (spec §2). A slim drag strip spans the
 // top (empty, so macOS traffic lights sit alone); the team block lives at the
@@ -61,7 +62,12 @@ function TitleBar() {
 export default function AppShell() {
   const activeConv = useStore((s) => s.activeConv)
   const settings = useStore((s) => s.settings)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  // 1.4 — which Settings section is open (null = closed) lives in the store:
+  // the notifications popover opens it on "Notifications" from two panes that
+  // have no way to reach this component.
+  const settingsSection = useStore((s) => s.settingsSection)
+  const openSettings = useStore((s) => s.openSettings)
+  const closeSettings = useStore((s) => s.closeSettings)
   const [railOpen, setRailOpen] = useState(true)
   const [railTab, setRailTab] = useState<RailTab>('about')
 
@@ -115,7 +121,7 @@ export default function AppShell() {
       <TitleBar />
 
       <div style={{ flex: 1, minHeight: 0, display: 'flex', ...NO_DRAG }}>
-        <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
+        <Sidebar onOpenSettings={() => openSettings()} />
 
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
           {convKind === 'team' ? (
@@ -168,7 +174,8 @@ export default function AppShell() {
       <BeamSurface />
       <PrAlert />
       <UpdateBanner />
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      <LaunchNudge />
+      {settingsSection && <SettingsModal section={settingsSection} onClose={closeSettings} />}
     </div>
   )
 }

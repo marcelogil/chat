@@ -1,10 +1,11 @@
 import type { ConvId } from '@shared/types'
 import { useStore } from '@/store'
-import { Avatar, DeviceChip, IconButton, identityHue } from '@/ui/atoms'
+import { Avatar, IconButton, identityHue } from '@/ui/atoms'
 import { ShareButton } from '@/screenshare/ShareUi'
 import { truncate } from './chrome'
 import { IconLock, IconPanel, IconPin } from './icons'
 import { useDmMap, useGroupMap } from './dm'
+import { PersonLines } from './PersonLines'
 import type { RailTab } from './RightRail'
 
 // Spec §2.3 — 52px conversation header with the right-rail controls.
@@ -99,11 +100,27 @@ export default function ChannelHeader({
         </>
       ) : peer ? (
         <>
-          <Avatar name={peer.name} size={24} presence={peer.state} />
-          <span style={{ fontSize: 17, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' }}>{peer.name}</span>
-          <DeviceChip hostname={peer.hostname} fingerprint={peer.fingerprint} warn={peer.trust === 'flagged'} />
-          <span style={{ ...truncate, flex: 1, minWidth: 0, fontSize: 13, color: 'var(--text-3)' }}>
-            {peer.status || (peer.state === 'online' ? 'online' : peer.state)}
+          {/* Name over status, with the identity chip revealed on hover or
+              keyboard focus of this block (1.4) — it used to sit between the
+              name and the status and read as part of the name. */}
+          <span
+            className="sem-reveal-host"
+            tabIndex={0}
+            title={`${peer.name} — device ${peer.hostname}·${peer.fingerprint}${peer.status ? `\n${peer.status}` : ''}`}
+            style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0, borderRadius: 'var(--r-sm)' }}
+          >
+            <Avatar name={peer.name} size={24} presence={peer.state} />
+            <PersonLines
+              name={peer.name}
+              status={peer.status}
+              state={peer.state}
+              departed={peer.departed}
+              hostname={peer.hostname}
+              fingerprint={peer.fingerprint}
+              warn={peer.trust === 'flagged'}
+              nameSize={17}
+              nameWeight={600}
+            />
           </span>
         </>
       ) : (

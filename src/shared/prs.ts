@@ -1,5 +1,6 @@
 import type { PushMessage } from './bridge'
 import type { GrpPayload, PrView, PrsConfig, PrsPayload, PrsRepo, VerifiedEvent } from './types'
+import { PRS } from './constants'
 
 // Pure helpers for the pull-request group: the shape of the Azure DevOps JSON
 // we consume, the approval/tracking rules, and the LWW merge of the
@@ -21,6 +22,39 @@ export interface AdoPullRequest {
   targetRefName: string // 'refs/heads/main'
   repository: { id: string; name: string }
   reviewers: { id: string; displayName: string; vote: number; isRequired?: boolean }[]
+  /** The head of the source branch as ADO last merged it — changes on every push (1.4). */
+  lastMergeSourceCommit?: { commitId?: string }
+}
+
+/**
+ * One comment inside a pull-request thread (1.4). `commentType` matters: ADO
+ * writes its own bookkeeping ("Ada voted 10", "updated the pull request") as
+ * `system` comments in threads that look exactly like human ones, and counting
+ * those as review conversation would leave every PR permanently "commented".
+ */
+export interface AdoThreadComment {
+  id?: number
+  author?: { id?: string; displayName?: string }
+  publishedDate?: string
+  commentType?: string // 'text' | 'system' | 'codeChange'
+  isDeleted?: boolean
+}
+
+/** A pull-request comment thread (1.4). Exists from API 3.0 (TFS 2017). */
+export interface AdoThread {
+  id: number
+  /** 'unknown' | 'active' | 'fixed' | 'wontFix' | 'closed' | 'byDesign' | 'pending' */
+  status?: string
+  publishedDate?: string
+  lastUpdatedDate?: string
+  isDeleted?: boolean
+  comments?: AdoThreadComment[]
+}
+
+/** One pushed revision of a pull request (1.4). Exists from API 3.0. */
+export interface AdoIteration {
+  id: number
+  createdDate?: string
 }
 
 const REF_PREFIX = 'refs/heads/'
@@ -50,9 +84,17 @@ export function isApproved(reviewers: PrView['reviewers']): boolean {
   return anyApproval
 }
 
-/** A PR is worth showing while it is open, not a draft, and not yet approved. */
+/**
+ * A PR is worth showing while it is open and not a draft.
+ *
+ * 1.4 keeps approved pull requests in the list ("Ready to complete") — they
+ * were the ones that got forgotten, which is the whole point of the waiting
+ * states. They never count toward the badge: `PrsStatus.unseen` skips the
+ * `approved` state, so the sidebar still means "waiting for someone".
+ * (Through 1.3 this also required `!isApproved(reviewers)`.)
+ */
 export function isTracked(pr: { isDraft: boolean; status: string; reviewers: PrView['reviewers'] }): boolean {
-  return pr.status === 'active' && !pr.isDraft && !isApproved(pr.reviewers)
+  return pr.status === 'active' && !pr.isDraft
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +116,7 @@ export function toPrView(
   }))
   const mine = ctx.meId ? reviewers.find((r) => r.id === ctx.meId) : undefined
   const createdAt = Date.parse(raw.creationDate)
+  const lastMergeCommit = typeof raw.lastMergeSourceCommit?.commitId === 'string' ? raw.lastMergeSourceCommit.commitId : ''
 
   return {
     key,
@@ -91,6 +134,10 @@ export function toPrView(
     myVote: mine ? mine.vote : 0,
     webUrl: `${ctx.baseUrl}/${encodeURIComponent(ctx.project)}/_git/${encodeURIComponent(repoName)}/pullrequest/${id}`,
     seen: ctx.seen.has(key),
+    // '' when the server didn't say: an empty string still compares equal
+    // between polls, so a server that never reports it simply never triggers a
+    // commit-change refresh (the 5-minute round robin still covers it).
+    lastMergeCommit,
   }
 }
 
@@ -103,6 +150,19 @@ function validRepos(v: unknown): v is PrsRepo[] {
     (r) =>
       !!r && typeof r === 'object' && typeof (r as PrsRepo).id === 'string' && typeof (r as PrsRepo).name === 'string',
   )
+}
+
+/**
+ * A shared threshold off the share, clamped to the range the prefs pane
+ * enforces. Anything else — absent (a 1.3 publisher), not a number, out of
+ * range — reads as `fallback` rather than dropping the whole snapshot: an odd
+ * number here must never cost the team its base URL. `fallback` is the value
+ * already in force (see materializePrsConfig), not the constant default.
+ */
+function threshold(v: unknown, fallback: number, [lo, hi]: readonly [number, number]): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return fallback
+  const n = Math.round(v)
+  return n < lo || n > hi ? fallback : n
 }
 
 function validConfig(v: unknown): v is PrsConfig {
@@ -124,6 +184,13 @@ function validConfig(v: unknown): v is PrsConfig {
 export function materializePrsConfig(events: VerifiedEvent[]): { config: PrsConfig; by: string; id: string } | null {
   const sorted = [...events].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   let winner: { config: PrsConfig; by: string; id: string } | null = null
+  // 1.4 — the thresholds in force so far, carried across snapshots that do not
+  // mention them. A 1.3 client cannot see these fields, so its perfectly
+  // ordinary re-publish (renaming a repo, pasting a token) must not read as
+  // "the team decided to go back to 48 h / 14 d". They start at the constants
+  // and only a value inside the published range replaces them.
+  let reviewSlaHours: number = PRS.reviewSlaHours
+  let staleAfterDays: number = PRS.staleAfterDays
 
   for (const ev of sorted) {
     if (!ev.verified) continue
@@ -136,12 +203,18 @@ export function materializePrsConfig(events: VerifiedEvent[]): { config: PrsConf
     // that does not normalize is dropped and the previous winner stands.
     const baseUrl = p.config.baseUrl === '' ? '' : normalizeBaseUrl(p.config.baseUrl)
     if (baseUrl === null) continue
+    reviewSlaHours = threshold(p.config.reviewSlaHours, reviewSlaHours, PRS.reviewSlaHoursRange)
+    staleAfterDays = threshold(p.config.staleAfterDays, staleAfterDays, PRS.staleAfterDaysRange)
     winner = {
       config: {
         baseUrl,
         project: p.config.project,
         repos: p.config.repos.map((r) => ({ id: r.id, name: r.name })),
         sharedToken: p.config.sharedToken,
+        // Always concrete after materialization, so nothing downstream has to
+        // re-apply the defaults (1.4).
+        reviewSlaHours,
+        staleAfterDays,
       },
       by: ev.author,
       id: ev.id,

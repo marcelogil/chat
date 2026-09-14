@@ -4,12 +4,13 @@ import { materialize } from '@shared/merge'
 import { RETENTION } from '@shared/constants'
 import { useStore, selfOf } from '@/store'
 import { safeThumbSrc } from '@/content/parse'
-import { Avatar, DeviceChip, formatBytes, formatTime, IconButton } from '@/ui/atoms'
+import { Avatar, formatBytes, formatTime, IconButton } from '@/ui/atoms'
 import { SectionLabel, truncate } from './chrome'
 import { IconFile, IconLock, IconPin, IconX } from './icons'
 import { useBeamTarget, BeamLabel } from './beam'
 import { openDm, useDmMap, useGroupMap } from './dm'
 import { groupMemberRows } from './groupMembers'
+import { PersonLines } from './PersonLines'
 
 // Spec §2.4 — right rail: About / Members / Files / Pinned. Member rows are
 // beam drop targets, same as sidebar DM rows.
@@ -32,8 +33,8 @@ function MemberRow({ p, isSelf }: { p: PresenceView; isSelf: boolean }) {
       onClick={() => {
         if (!isSelf) void openDm(p.deviceId)
       }}
-      title={isSelf ? `${p.name} (you)` : `Message ${p.name}`}
-      aria-label={isSelf ? `${p.name}, you` : `Member ${p.name}, ${p.state}`}
+      title={`${isSelf ? `${p.name} (you)` : `Message ${p.name}`} — device ${p.hostname}·${p.fingerprint}${p.status ? `\n${p.status}` : ''}`}
+      aria-label={`${isSelf ? `${p.name}, you` : `Member ${p.name}, ${p.state}`}${p.status ? `, status ${p.status}` : ''}`}
       {...beamProps}
       style={{
         width: '100%',
@@ -53,27 +54,20 @@ function MemberRow({ p, isSelf }: { p: PresenceView; isSelf: boolean }) {
       ) : (
         <>
           <Avatar name={p.name} size={28} presence={p.state} desaturate={p.state === 'away'} />
-          <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-              <span
-                style={{
-                  ...truncate,
-                  fontSize: 13,
-                  fontWeight: 500,
-                  color: p.state === 'offline' ? 'var(--text-3)' : 'var(--text-1)',
-                }}
-              >
-                {p.name}
-                {isSelf ? ' (you)' : ''}
-              </span>
-              <DeviceChip hostname={p.hostname} fingerprint={p.fingerprint} warn={p.trust === 'flagged'} />
-            </span>
-            {p.status && (
-              <span style={{ ...truncate, display: 'block', fontSize: 11, color: 'var(--text-3)', marginTop: 1 }}>
-                {p.status}
-              </span>
-            )}
-          </span>
+          {/* The status is the second line, always — and the identity chip
+              waits for a hover instead of sitting next to every name (1.4). */}
+          <PersonLines
+            name={p.name}
+            suffix={isSelf ? ' (you)' : undefined}
+            status={p.status}
+            state={p.state}
+            departed={p.departed}
+            hostname={p.hostname}
+            fingerprint={p.fingerprint}
+            warn={p.trust === 'flagged'}
+            nameWeight={500}
+            nameColor={p.state === 'offline' ? 'var(--text-3)' : 'var(--text-1)'}
+          />
         </>
       )}
     </button>
@@ -93,6 +87,7 @@ export default function RightRail({
 }) {
   const channels = useStore((s) => s.channels)
   const presence = useStore((s) => s.presence)
+  const selfPresence = useStore((s) => s.selfPresence)
   const events = useStore((s) => s.events[conv])
   const boot = useStore((s) => s.boot)
   const dmPeers = useDmMap((s) => s.peers)
@@ -137,12 +132,29 @@ export default function RightRail({
             group.members,
             presence,
             self
-              ? { deviceId: self.deviceId, name: self.displayName, hostname: self.hostname, fingerprint: self.fingerprint }
+              ? {
+                  deviceId: self.deviceId,
+                  name: self.displayName,
+                  hostname: self.hostname,
+                  fingerprint: self.fingerprint,
+                  // 1.4: our own status belongs on our own row here too.
+                  status: selfPresence?.status,
+                  state: selfPresence?.state,
+                }
               : null,
             group.conv,
           )
         : [],
-    [group, presence, self?.deviceId, self?.displayName, self?.hostname, self?.fingerprint],
+    [
+      group,
+      presence,
+      self?.deviceId,
+      self?.displayName,
+      self?.hostname,
+      self?.fingerprint,
+      selfPresence?.status,
+      selfPresence?.state,
+    ],
   )
   const memberRows = group ? groupMembers : sortedMembers
 

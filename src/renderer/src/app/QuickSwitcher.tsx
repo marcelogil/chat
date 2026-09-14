@@ -7,6 +7,8 @@ import { Avatar, identityHue } from '@/ui/atoms'
 import { modKey, truncate } from './chrome'
 import { IconCalendar, IconGitPull, IconLock, IconSearch } from './icons'
 import { openDm } from './dm'
+import { peopleRows } from './peopleRows'
+import { preferFreshestTwin } from './twinDevices'
 
 // Sidebar quick switcher (spec §2.2.2): ⌘K/Ctrl-K focuses it; fuzzy-matches
 // channels and people; ↑↓ navigate, ⏎ opens, Esc dismisses.
@@ -49,9 +51,22 @@ export default function QuickSwitcher() {
   const channels = useStore((s) => s.channels)
   const groups = useStore((s) => s.groups)
   const presence = useStore((s) => s.presence)
+  const events = useStore((s) => s.events)
+  const myReads = useStore((s) => s.myReads)
+  const unreadCount = useStore((s) => s.unreadCount)
   const boot = useStore((s) => s.boot)
   const setActiveConv = useStore((s) => s.setActiveConv)
   const self = selfOf(boot)
+
+  const people = useMemo(
+    () =>
+      peopleRows(preferFreshestTwin(presence), self?.deviceId ?? '', {
+        hasHistory: (conv) => (events[conv] ?? []).some((e) => e.type === 'msg'),
+        unread: (conv) => unreadCount(conv),
+      }),
+    // events/myReads are what unreadCount reads; listing them keeps the memo honest.
+    [presence, self?.deviceId, unreadCount, events, myReads],
+  )
 
   const [q, setQ] = useState('')
   const [focused, setFocused] = useState(false)
@@ -88,22 +103,28 @@ export default function QuickSwitcher() {
       if (s !== null)
         out.push({ key: `g:${g.conv}`, kind: 'group', label: g.name, sub: 'private group', conv: g.conv, score: s + 0.5 })
     }
-    for (const p of presence) {
-      if (p.deviceId === self?.deviceId || p.departed) continue
-      const s = fuzzyScore(q, p.name) ?? fuzzyScore(q, p.hostname)
+    // The same rows the sidebar's DM list shows, under the same names (1.4):
+    // a device superseded by a re-join is searchable exactly while its DM
+    // still holds history, and then as "Gil (previous device)" — the sidebar
+    // keeps that conversation reachable, and ⌘K was the one way to reach a
+    // conversation that could not find it. `preferFreshestTwin` settles the
+    // seconds before main can tell the two apart (twinDevices.ts).
+    for (const row of people) {
+      const p = row.person
+      const s = fuzzyScore(q, row.label) ?? fuzzyScore(q, p.hostname)
       if (s !== null)
         out.push({
           key: `p:${p.deviceId}`,
           kind: 'person',
-          label: p.name,
-          sub: `${p.hostname} · ${p.state}`,
+          label: row.label,
+          sub: `${p.hostname} · ${p.supersededBy ? 'no longer on the share' : p.state}`,
           peerDeviceId: p.deviceId,
           score: s,
         })
     }
     out.sort((a, b) => b.score - a.score)
     return out.slice(0, 8)
-  }, [q, channels, groups, presence, self?.deviceId])
+  }, [q, channels, groups, people])
 
   useEffect(() => {
     setSel(0)

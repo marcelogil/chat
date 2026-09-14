@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { KeyboardEvent, MouseEvent, ReactNode } from 'react'
 import { Button } from '@/ui/atoms'
+import { NO_DRAG } from './chrome'
 
 /** Tab/Shift+Tab wrap-around within a dialog root — `Button` doesn't forward
  * refs, so this walks the DOM rather than tracking individual element refs.
@@ -183,6 +184,12 @@ export function ConfirmDialog({
       onClick={onClose}
       role="presentation"
       style={{
+        // 1.4: a modal backdrop covers the shell's drag strip, and Chromium
+        // works the draggable region out from the DOM rather than from z-order
+        // — so without this, click-away-to-dismiss in the top ~36 px started a
+        // window drag instead. Same reason the diagram editor's header owns its
+        // own region; see app/overlayChrome.ts.
+        ...NO_DRAG,
         position: 'fixed',
         inset: 0,
         zIndex,

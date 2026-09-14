@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { OnboardHealth } from '@shared/bridge'
+import { useStore } from '@/store'
 import { Button, Spinner } from '@/ui/atoms'
 import { ChromeCss } from '@/app/chrome'
 import { GradientMesh } from './mesh'
@@ -86,13 +87,26 @@ export default function Onboarding({
         displayName: displayName.trim(),
         teamName: joining ? (health?.existingTeamName ?? '') : teamName.trim(),
       })
-      .catch((err) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }))
+      .catch((err) => ({
+        ok: false as const,
+        error: err instanceof Error ? err.message : String(err),
+        message: undefined as string | undefined,
+      }))
     if (res.ok) {
       setLeaving(true) // the boot push replaces this screen; scale out gracefully
       return
     }
+    // This machine already holds sealed Chat data nobody has unlocked. Setting
+    // up here would destroy the device identity in it, so main refused — the
+    // only honest next screen is the unlock one, which also carries the
+    // confirmed "start fresh" path for someone who really does want a new
+    // device. The notice lives in the store, so it survives this unmount.
+    if (res.error === 'locked-profile') {
+      void useStore.getState().showUnlockScreen(res.message ?? res.error)
+      return
+    }
     setSubmitting(false)
-    setSubmitError(res.error)
+    setSubmitError(res.message ?? res.error)
     if (/passphrase|decrypt|wrong|check/i.test(res.error)) {
       setErrStep(1)
       setShakeKey((k) => k + 1)

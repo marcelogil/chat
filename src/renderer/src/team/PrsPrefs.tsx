@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { AdoError, PrsProbe, PrsRepo } from '@shared/types'
+import { PRS } from '@shared/constants'
 import { normalizeBaseUrl } from '@shared/prs'
 import { useStore } from '@/store'
 import { Button, Spinner } from '@/ui/atoms'
@@ -31,6 +32,13 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       {hint && <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: '16px' }}>{hint}</div>}
     </div>
   )
+}
+
+/** A typed threshold, or null while it is empty or outside the shared range. */
+function whole(text: string, [lo, hi]: readonly [number, number]): number | null {
+  if (!/^\d{1,4}$/.test(text.trim())) return null
+  const n = Number.parseInt(text.trim(), 10)
+  return n >= lo && n <= hi ? n : null
 }
 
 function Note({ tone, children }: { tone: 'info' | 'warn'; children: ReactNode }) {
@@ -95,6 +103,11 @@ export function PrsPrefs({ onClose }: { onClose: () => void }) {
   // editing, so re-saving the repo list never silently un-shares a token the
   // rest of the team is relying on.
   const [share, setShare] = useState(status?.sharedTokenSet === true)
+  // 1.4 — the two team-shared waiting thresholds. Kept as text so the field
+  // can be empty mid-edit; Save is blocked until both parse inside the range
+  // that `prs.saveConfig` enforces on the other side of the bridge.
+  const [slaHours, setSlaHours] = useState(() => String(status?.reviewSlaHours ?? PRS.reviewSlaHours))
+  const [staleDays, setStaleDays] = useState(() => String(status?.staleAfterDays ?? PRS.staleAfterDays))
   const [saving, setSaving] = useState(false)
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
 
@@ -230,11 +243,20 @@ export function PrsPrefs({ onClose }: { onClose: () => void }) {
   }, [allRepos, repoQuery])
 
   const checkedRepos = useMemo(() => allRepos.filter((r) => checked[r.id]).map((r) => ({ id: r.id, name: r.name })), [allRepos, checked])
+  const sla = whole(slaHours, PRS.reviewSlaHoursRange)
+  const stale = whole(staleDays, PRS.staleAfterDaysRange)
   const canSave =
-    probeValid && checkedRepos.length > 0 && !saving && !loadingRepos && normalized !== null && project !== ''
+    probeValid &&
+    checkedRepos.length > 0 &&
+    !saving &&
+    !loadingRepos &&
+    normalized !== null &&
+    project !== '' &&
+    sla !== null &&
+    stale !== null
 
   async function save() {
-    if (!canSave || normalized === null) return
+    if (!canSave || normalized === null || sla === null || stale === null) return
     setSaving(true)
     try {
       await window.bridge.prs.saveConfig({
@@ -243,6 +265,8 @@ export function PrsPrefs({ onClose }: { onClose: () => void }) {
         repos: checkedRepos,
         token: trimmedToken,
         shareToken: share,
+        reviewSlaHours: sla,
+        staleAfterDays: stale,
       })
       setToken('') // the secret leaves the DOM the moment it is stored
       setProbedKey('')
@@ -623,6 +647,45 @@ export function PrsPrefs({ onClose }: { onClose: () => void }) {
                 share a read-only token (scope <b>Code → Read</b>) with a short expiry.
               </Note>
             )}
+          </Field>
+
+          {/* 4 — Waiting thresholds (1.4), shared with the whole team */}
+          <Field
+            label="Waiting thresholds"
+            hint={`Shared with the team, like the repository list. ${PRS.reviewSlaHoursRange[0]}–${PRS.reviewSlaHoursRange[1]} hours and ${PRS.staleAfterDaysRange[0]}–${PRS.staleAfterDaysRange[1]} days.`}
+          >
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-1)' }}>
+              <span style={{ flex: 1, minWidth: 0 }}>Flag a review as overdue after</span>
+              <input
+                className="sem-input"
+                type="number"
+                inputMode="numeric"
+                min={PRS.reviewSlaHoursRange[0]}
+                max={PRS.reviewSlaHoursRange[1]}
+                value={slaHours}
+                onChange={(e) => setSlaHours(e.target.value)}
+                aria-label="Flag a review as overdue after this many hours"
+                title="Flag a review as overdue after this many hours"
+                style={{ width: 82, textAlign: 'right', borderColor: sla === null ? 'var(--danger)' : undefined }}
+              />
+              <span style={{ color: 'var(--text-3)', width: 46 }}>hours</span>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-1)' }}>
+              <span style={{ flex: 1, minWidth: 0 }}>Call a pull request stale after</span>
+              <input
+                className="sem-input"
+                type="number"
+                inputMode="numeric"
+                min={PRS.staleAfterDaysRange[0]}
+                max={PRS.staleAfterDaysRange[1]}
+                value={staleDays}
+                onChange={(e) => setStaleDays(e.target.value)}
+                aria-label="Call a pull request stale after this many days with no activity"
+                title="Call a pull request stale after this many days with no activity"
+                style={{ width: 82, textAlign: 'right', borderColor: stale === null ? 'var(--danger)' : undefined }}
+              />
+              <span style={{ color: 'var(--text-3)', width: 46 }}>days</span>
+            </label>
           </Field>
         </div>
 

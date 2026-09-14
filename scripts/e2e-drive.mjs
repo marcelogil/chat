@@ -185,7 +185,8 @@ function addDays(d, n) {
 // Fake Azure DevOps
 //
 // Just enough of the 6.0 REST surface for AdoClient: connectionData, projects,
-// repositories, and active pull requests. It insists on the Basic header the
+// repositories, active pull requests, and (1.4) each PR's comment threads and
+// iterations. It insists on the Basic header the
 // client builds from `:${token}` and answers anything else with the 203 +
 // sign-in-page that real Azure DevOps sends for a rejected PAT — which is the
 // one response shape the client's classifier most needs to see in the wild.
@@ -200,9 +201,10 @@ const ADO_REPOS = [
 ]
 
 /** One pull request in the shape AdoClient/`toPrView` read. */
-function adoPr({ id, repo, title, author, source, target, reviewers, isDraft = false, status = 'active', ageH = 3 }) {
+function adoPr({ id, repo, title, author, source, target, reviewers, isDraft = false, status = 'active', ageH = 3, commit = '' }) {
   return {
     pullRequestId: id,
+    lastMergeSourceCommit: { commitId: commit || `c${id}` },
     title,
     status,
     isDraft,
@@ -248,7 +250,58 @@ async function startAdo() {
       }),
     ],
   }
-  const state = { prs, requests: 0, rejected: 0 }
+  // 1.4 — per-PR comment threads and iterations. #4271 carries one open thread
+  // whose last word is the reviewer's (→ comments-open, waiting on the author)
+  // and one pushed iteration; the approved #4288 has neither.
+  const ago = (h) => new Date(Date.now() - h * 3600_000).toISOString()
+  const details = {
+    4271: {
+      threads: [
+        {
+          id: 91,
+          status: 'active',
+          publishedDate: ago(2),
+          lastUpdatedDate: ago(1),
+          comments: [
+            {
+              id: 1,
+              author: { id: ADO_ME.id, displayName: ADO_ME.providerDisplayName },
+              publishedDate: ago(2),
+              commentType: 'text',
+            },
+            {
+              id: 2,
+              author: { id: DANA.id, displayName: DANA.displayName },
+              publishedDate: ago(1.5),
+              commentType: 'text',
+            },
+            {
+              id: 3,
+              author: { id: ADO_ME.id, displayName: ADO_ME.providerDisplayName },
+              publishedDate: ago(1),
+              commentType: 'text',
+            },
+          ],
+        },
+        // A resolved thread and a pure system thread: neither may count.
+        {
+          id: 92,
+          status: 'fixed',
+          publishedDate: ago(3),
+          comments: [{ id: 1, author: { id: DANA.id }, publishedDate: ago(3), commentType: 'text' }],
+        },
+        {
+          id: 93,
+          status: 'active',
+          publishedDate: ago(3),
+          comments: [{ id: 1, author: { id: ADO_ME.id }, publishedDate: ago(3), commentType: 'system' }],
+        },
+      ],
+      iterations: [{ id: 1, createdDate: ago(3) }],
+    },
+    4288: { threads: [], iterations: [] },
+  }
+  const state = { prs, details, requests: 0, rejected: 0 }
 
   const server = createServer((req, res) => {
     state.requests += 1
@@ -280,6 +333,13 @@ async function startAdo() {
       return list(state.prs[decodeURIComponent(m[2])] ?? [])
     }
 
+    // 1.4 — threads and iterations of one pull request.
+    m = /^\/([^/]+)\/_apis\/git\/repositories\/([^/]+)\/pullRequests\/(\d+)\/(threads|iterations)$/i.exec(path)
+    if (m && decodeURIComponent(m[1]) === ADO_PROJECT.name) {
+      const detail = state.details[Number(m[3])] ?? { threads: [], iterations: [] }
+      return list(m[4].toLowerCase() === 'threads' ? detail.threads : detail.iterations)
+    }
+
     res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({ message: `no route for ${path}` }))
   })
@@ -302,7 +362,16 @@ async function main() {
   mkdirSync(OUT, { recursive: true })
   mkdirSync(SHOTS, { recursive: true })
   const appSupport = join(homedir(), 'Library', 'Application Support')
-  for (const p of ['Chat-e2e-alice', 'Chat-e2e-bob', 'semaphore-e2e-alice', 'semaphore-e2e-bob']) {
+  // alice2 is the re-join profile: a third instance, same machine, same
+  // display name, brand-new local data — what "Reset local data" leaves behind.
+  for (const p of [
+    'Chat-e2e-alice',
+    'Chat-e2e-alice2',
+    'Chat-e2e-bob',
+    'semaphore-e2e-alice',
+    'semaphore-e2e-alice2',
+    'semaphore-e2e-bob',
+  ]) {
     rmSync(join(appSupport, p), { recursive: true, force: true })
   }
 
@@ -322,9 +391,12 @@ async function main() {
 
   const procA = launch('alice', 9333)
   const procB = launch('bob', 9334)
+  /** Alice again, after a reset — started near the end of the run (1.4). */
+  let procC = null
   const kill = () => {
     try { procA.kill() } catch {}
     try { procB.kill() } catch {}
+    try { procC?.kill() } catch {}
     try { ado.server.closeAllConnections?.() } catch {}
     try { ado.server.close() } catch {}
   }
@@ -418,6 +490,45 @@ async function main() {
       presA ? `${presA.hostname}·${presA.fingerprint}·${presA.state}` : '',
     )
 
+    // ---- Status line (1.4) -------------------------------------------------
+    // The bug Gil reported: a status went nowhere visible. Three things to
+    // prove, all over the bridge — it comes back on our own row (there was no
+    // such row before, which is why the footer could never show it), it lands
+    // in plaintext settings (so the next launch can restore it), and it
+    // reaches the other side under her name.
+    await alice.eval(`window.bridge.presence.setStatus('back at 3')`)
+    const selfStatus = await until(async () => {
+      const me = await alice.eval(`window.bridge.presence.self()`)
+      return me?.status === 'back at 3' ? me : undefined
+    }, 10000)
+    check(
+      'alice sees her own status immediately (presence.self)',
+      !!selfStatus,
+      selfStatus ? `${selfStatus.name}: ${selfStatus.status}` : 'no self row',
+    )
+    const savedStatus = await alice.eval(`window.bridge.settings.get()`)
+    check(
+      'the status is persisted in settings, so a restart keeps it',
+      savedStatus?.status === 'back at 3',
+      JSON.stringify(savedStatus?.status ?? null),
+    )
+    const statusAtBob = await until(async () => {
+      const list = await bob.eval(`window.bridge.presence.list()`)
+      const aliceView = list?.find((p) => p.name === 'Alice')
+      return aliceView?.status === 'back at 3' ? aliceView : undefined
+    }, 30000)
+    check("alice sets a status, bob sees it under her name", !!statusAtBob, statusAtBob?.status ?? '')
+    // The sidebar row is where it has to be readable: the aria-label carries
+    // the status, and the row is the two-line kind now.
+    const bobDmLabel = await until(async () => {
+      const labels = await bob.eval(
+        `Array.from(document.querySelectorAll('button[aria-label^="Direct message Alice"]')).map((n) => n.getAttribute('aria-label'))`,
+      )
+      return labels?.find((l) => l.includes('status back at 3'))
+    }, 20000)
+    check("bob's sidebar row for alice names her status", !!bobDmLabel, bobDmLabel ?? '')
+    await alice.eval(`window.bridge.presence.setStatus('')`)
+
     // E2E DM: bob -> alice
     const dm = await bob.eval(`window.bridge.chat.dmFor(${JSON.stringify(selfA.self.deviceId)})`)
     check('bob derives the DM conversation', !!dm?.conv)
@@ -467,6 +578,112 @@ async function main() {
       "alice's chat.renameChannel on the fixed #general channel rejects",
       fixedRenameErr !== '',
       fixedRenameErr || 'no error thrown',
+    )
+
+    // ---- "Say hello" twice, the second time in a channel that has only just
+    // appeared (1.4) ---------------------------------------------------------
+    // The report: sometimes the empty state's button did nothing. Two causes,
+    // both exercised here — the button's own `sending` latch, which used to
+    // survive a conversation switch (so the *first* successful hello disabled
+    // the button in every empty conversation opened afterwards), and main
+    // rejecting a send into a channel it had not read `channel.json.e1` for.
+    // #product is empty at this point: nobody has ever written into it.
+    const openedProduct = await until(async () => {
+      const ok = await alice.eval(
+        `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel product"]');` +
+          ` if (!el) return false; el.click(); return true })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('alice opens the empty #product channel', openedProduct === true)
+    const firstHello = await until(async () => {
+      const ok = await alice.eval(
+        `(() => { const el = document.querySelector('button[aria-label="Say hello"]');` +
+          ` if (!el || el.disabled) return false; el.click(); return true })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('alice presses Say hello in #product', firstHello === true)
+    const gotFirstHello = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(designCh?.conv)})`)
+      return evs?.find((e) => e.type === 'msg' && (e.payload?.body?.text || '').startsWith('Hello'))
+    }, 30000)
+    check('bob receives that first hello', !!gotFirstHello, gotFirstHello ? gotFirstHello.payload.body.text : 'never arrived')
+
+    const helloCh = await bob.eval(`window.bridge.chat.createChannel('greetings')`)
+    check('bob creates #greetings', !!helloCh?.conv, helloCh ? `${helloCh.name} (${helloCh.conv})` : '')
+    // A channel nobody has written into is advertised by nothing, so the only
+    // discovery left is the blanket sweep (1–10 minutes, tier dependent). One
+    // sys event puts the conv id in Bob's beacon heads, which is the path a
+    // real "somebody just made a channel" takes within a tick — and a rename
+    // is not a message, so the empty state stays up.
+    const helloRenameErr = await bob.eval(
+      `window.bridge.chat.renameChannel(${JSON.stringify(helloCh?.conv)}, 'greetings-all')` +
+        `.then(() => '', (x) => String((x && x.message) || x))`,
+    )
+    check('bob renames it so the conv id rides his beacon heads', helloRenameErr === '', helloRenameErr)
+    const aliceSees = await until(async () => {
+      const chs = await alice.eval(`window.bridge.chat.channels()`)
+      return chs?.find((c) => c.conv === helloCh?.conv)
+    }, 60000)
+    check(
+      "alice's sidebar picks up #greetings-all without waiting for a sweep",
+      !!aliceSees,
+      aliceSees ? aliceSees.name : 'never appeared',
+    )
+
+    // Open the row and press the real button — no store poking.
+    const openedHello = await until(async () => {
+      const ok = await alice.eval(
+        `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel greetings"]');` +
+          ` if (!el) return false; el.click(); return true })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('alice opens #greetings-all from the sidebar', openedHello === true)
+    const helloBtn = await until(async () => {
+      const state = await alice.eval(
+        `(() => { const el = document.querySelector('button[aria-label="Say hello"]');` +
+          ` return el ? { disabled: !!el.disabled } : null })()`,
+      )
+      return state ?? undefined
+    }, 20000)
+    check(
+      'the Say hello button is live again in the new channel (not latched by the #product hello)',
+      !!helloBtn && helloBtn.disabled === false,
+      helloBtn ? `disabled=${helloBtn.disabled}` : 'no button',
+    )
+    const helloClicked = await alice.eval(
+      `(() => { const el = document.querySelector('button[aria-label="Say hello"]');` +
+        ` if (!el || el.disabled) return false; el.click(); return true })()`,
+    )
+    check('alice clicks Say hello', helloClicked === true)
+
+    const gotHello = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(helloCh?.conv)})`)
+      return evs?.find((e) => e.type === 'msg' && (e.payload?.body?.text || '').startsWith('Hello'))
+    }, 30000)
+    check(
+      'bob receives the hello sent from the empty state (verified)',
+      !!gotHello && gotHello.verified === true,
+      gotHello ? gotHello.payload.body.text : 'never arrived',
+    )
+    const emptyStateGone = await until(async () => {
+      const gone = await alice.eval(`document.querySelector('button[aria-label="Say hello"]') === null`)
+      return gone === true ? true : undefined
+    }, 15000)
+    check('the empty state gives way to the message on alice', emptyStateGone === true)
+
+    // A rejected send must never be silent: sending into a conversation main
+    // cannot open puts a reason on the toast rail rather than doing nothing.
+    const helloErr = await alice.eval(
+      `window.bridge.chat.send('chan:deadbeef', { text: 'Hello 👋', kind: 'text' })` +
+        `.then(() => '', (x) => String((x && x.message) || x))`,
+    )
+    check(
+      'a send into a channel that is not on the share rejects with a reason',
+      /unknown conversation/.test(helloErr),
+      helloErr || 'resolved instead of rejecting',
     )
 
     // ---- Private groups: create, DM-borne invite, message, rename (1.2) ----
@@ -543,6 +760,71 @@ async function main() {
       "bob's event body has lang === 'typescript'",
       gotCode?.payload?.body?.lang === 'typescript',
       gotCode ? `lang=${gotCode.payload.body.lang}` : 'timed out',
+    )
+
+    // ---- Quick replies: inline chip row above the composer (send-on-click) -
+    // A plain click sends the chip immediately as its own message — verified
+    // end to end (bob clicks the first chip, alice receives its text).
+    // Option/Alt-click (insert instead of send) is not independently
+    // drivable here: `.click()` carries no modifier keys, and there is no
+    // bridge-level hook to confirm "inserted" versus "sent" short of a
+    // synthetic Input.dispatchMouseEvent this script does not otherwise use
+    // anywhere. Skipped rather than faked; see the soft() note below.
+    //
+    // The chip sends to bob's *active* conversation, which until now was
+    // whatever the store auto-selected at boot (store/index.ts picks the first
+    // live channel). Pin it: click #general's real sidebar row first, then
+    // assert what the row is showing before pressing it — otherwise a changed
+    // default selection, or #product arriving ahead of #general, sends the
+    // chip somewhere else and the only symptom is a 20s timeout below.
+    const qmOpenedGeneral = await until(async () => {
+      const ok = await bob.eval(
+        `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+          ` if (!el) return false; el.click(); return true })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('bob opens #general before pressing a quick reply', qmOpenedGeneral === true)
+    const qmRow = await until(async () => {
+      const info = await bob.eval(
+        `(() => {
+          const row = document.querySelector('[role="group"][aria-label="Quick replies"]')
+          if (!row) return null
+          const chips = [...row.querySelectorAll('button')]
+          if (!chips.length) return null
+          return { count: chips.length, first: chips[0].textContent, label: chips[0].getAttribute('aria-label') }
+        })()`,
+      )
+      return info ?? undefined
+    }, 20000)
+    check(
+      'bob sees exactly the five default chips above the composer (first: On it 👀)',
+      qmRow?.count === 5 && qmRow?.first === 'On it 👀' && qmRow?.label === 'Send quick reply: On it 👀',
+      qmRow ? `${qmRow.count} chips, first=${JSON.stringify(qmRow.first)} label=${JSON.stringify(qmRow.label)}` : 'row never rendered',
+    )
+    const qmChipClicked = await bob.eval(
+      `(() => {
+        const row = document.querySelector('[role="group"][aria-label="Quick replies"]')
+        if (!row) return false
+        const chip = row.querySelector('button')
+        if (!chip) return false
+        chip.click()
+        return true
+      })()`,
+    )
+    check('bob clicks the first quick-reply chip', qmChipClicked === true)
+    const qmReceived = await until(async () => {
+      const evs = await alice.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.payload?.body?.kind === 'text' && e.payload?.body?.text === 'On it 👀')
+    }, 20000)
+    check(
+      'alice receives the quick-reply text as a normal message',
+      Boolean(qmReceived),
+      qmReceived ? '' : `never arrived in ${conv} — did the chip send to bob's other conversation?`,
+    )
+    soft(
+      'Option/Alt-click (insert instead of send) is not covered — not drivable without a real modifier-key click, and there is no bridge hook to verify it independently',
+      true,
     )
 
     // ---- Poll with a quick decision (1.3): vote, close, both directions ----
@@ -1228,6 +1510,152 @@ async function main() {
       (await bob.eval(`document.querySelector('.sem-diagram-host') === null`)) === true,
     )
 
+    // ---- Editor chrome (1.4): the header is the drag strip, not a trap -----
+    //
+    // Gil tested the packaged macOS build and found every control in the
+    // editor's top strip dead to the mouse, the title printed under the traffic
+    // lights, and no way out of the mode at all. The cause: Chromium derives
+    // `-webkit-app-region` from the DOM regardless of z-order, so the shell's
+    // 36 px drag strip stayed draggable *underneath* the editor overlay and the
+    // OS ate every press that landed there.
+    //
+    // A CDP click cannot reproduce that — it is dispatched into the DOM, below
+    // the level at which the window server steals the press, which is exactly
+    // why every run before this one passed. So what is checked here is the
+    // computed region the OS actually reads, plus the geometry that keeps the
+    // title clear of the traffic lights. The real-mouse half stays a manual
+    // check by construction.
+    // Two evals, because the menu is React state: it is not in the DOM until
+    // the render that follows the click.
+    const menuOpened = await bob.eval(
+      `(() => {
+         const b = document.querySelector('button[aria-label="Draw a diagram"]')
+         if (!b) return 'no composer button'
+         b.click()
+         return 'ok'
+       })()`,
+    )
+    await sleep(300)
+    const freshOpened =
+      menuOpened === 'ok'
+        ? await bob.eval(
+            `(() => {
+               const items = [...document.querySelectorAll('[role="menu"][aria-label="Diagram"] [role="menuitem"]')]
+               const item = items.find((e) => (e.textContent || '').includes('New diagram'))
+               if (!item) return 'no New diagram item'
+               item.click()
+               return 'ok'
+             })()`,
+          )
+        : menuOpened
+    soft('bob opens a fresh diagram from the composer', freshOpened === 'ok', String(freshOpened))
+
+    if (freshOpened === 'ok') {
+      const chrome = await until(
+        async () =>
+          await bob.eval(
+            `(() => {
+               const h = document.querySelector('[role="dialog"][aria-label^="Diagram editor"] > header')
+               if (!h) return undefined
+               // Computed first (that is what the OS reads); the inline style
+               // is the fallback so an empty computed value is reported rather
+               // than mistaken for "drag".
+               const region = (el) => {
+                 const c = getComputedStyle(el).getPropertyValue('-webkit-app-region').trim()
+                 return c || (el.style.webkitAppRegion || '').trim() || '(unset)'
+               }
+               const controls = [...h.querySelectorAll('button, input, [role="status"]')]
+               const title = h.querySelector('input[aria-label="Diagram title"]')
+               return {
+                 header: region(h),
+                 controls: controls.length,
+                 bad: controls
+                   .filter((el) => region(el) !== 'no-drag')
+                   .map((el) => (el.getAttribute('aria-label') || el.textContent || el.tagName) + ':' + region(el)),
+                 titleLeft: title ? Math.round(title.getBoundingClientRect().left) : -1,
+                 height: Math.round(h.getBoundingClientRect().height),
+                 close: !!h.querySelector('button[aria-label="Close the diagram editor"]'),
+                 closeText: (h.querySelector('button[aria-label="Close the diagram editor"]') || {}).textContent || '',
+               }
+             })()`,
+          ),
+        30000,
+      )
+      check(
+        'the diagram header is the window drag strip',
+        chrome?.header === 'drag',
+        chrome ? `region ${chrome.header}, ${chrome.height}px tall` : 'editor never appeared',
+      )
+      check(
+        'every control in the diagram header opts out of dragging',
+        !!chrome && chrome.controls > 0 && chrome.bad.length === 0,
+        chrome ? `${chrome.controls} controls${chrome.bad.length ? ` — still draggable: ${chrome.bad.join(', ')}` : ''}` : '',
+      )
+      check(
+        'the Close control is labelled, not a bare ×',
+        !!chrome?.close && /close/i.test(chrome.closeText),
+        chrome ? JSON.stringify(chrome.closeText) : '',
+      )
+      if (process.platform === 'darwin') {
+        check(
+          'the diagram title clears the macOS traffic lights',
+          !!chrome && chrome.titleLeft >= 72,
+          chrome ? `title starts at x=${chrome.titleLeft}` : '',
+        )
+      }
+
+      // Clean style (1.4): a fresh canvas opens with no pencil in it. Asked of
+      // Excalidraw's own app state, because `serializeAsJSON` drops every
+      // `currentItem*` key — the draft in localStorage cannot answer this.
+      const style = await until(
+        async () =>
+          await bob.eval(
+            `(() => {
+               const api = window.__sfDiagramApi
+               if (!api) return undefined
+               const s = api.getAppState()
+               return {
+                 roughness: s.currentItemRoughness,
+                 strokeWidth: s.currentItemStrokeWidth,
+                 fontFamily: s.currentItemFontFamily,
+                 roundness: s.currentItemRoundness,
+                 fillStyle: s.currentItemFillStyle,
+                 bg: s.viewBackgroundColor,
+               }
+             })()`,
+          ),
+        20000,
+      )
+      check(
+        'a fresh diagram starts in the clean style (no hand-drawn roughness)',
+        style?.roughness === 0 && style?.strokeWidth === 1 && style?.fontFamily === 6 && style?.fillStyle === 'solid',
+        style ? JSON.stringify(style) : 'no Excalidraw API',
+      )
+
+      // Escape from an idle canvas is the way out. Dispatched at whatever has
+      // focus (Excalidraw autofocuses its canvas), so it travels the same
+      // capture-phase path a real key press does.
+      await bob.eval(
+        `(() => {
+           const t = document.activeElement || document.body
+           t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+           return true
+         })()`,
+      )
+      await sleep(600)
+      check(
+        'Escape closes the diagram editor from an idle canvas',
+        (await bob.eval(`document.querySelector('.sem-diagram-host') === null`)) === true,
+        'no dirty confirm on an untouched canvas',
+      )
+      // Belt and braces for the rest of the run: if Escape did not do it, the
+      // Close button must.
+      await bob.eval(
+        `(() => { const c = document.querySelector('button[aria-label="Close the diagram editor"]'); if (c) c.click(); return true })()`,
+      )
+      await sleep(300)
+    }
+
     // ---- Beams: alice beams a file directly to bob; auto-flow via bridge ----
     // Persistent collector attached BEFORE the send so no push is missed.
     await bob.eval(
@@ -1352,14 +1780,26 @@ async function main() {
     const listA = await until(async () => {
       await alice.eval(`window.bridge.prs.refresh()`).catch(() => {})
       const l = await alice.eval(`window.bridge.prs.list()`)
-      return l?.length === 1 ? l : undefined
+      return l?.length === 2 ? l : undefined
     }, 30000)
+    const openPr = listA?.find((p) => p.id === 4271)
+    const donePr = listA?.find((p) => p.id === 4288)
     check(
-      'alice lists exactly the unapproved pull request (the approved one is filtered)',
-      listA?.length === 1 && listA[0].id === 4271 && listA[0].assignedToMe === true,
-      listA ? listA.map((p) => `#${p.id} ${p.repoName}`).join(' ') : 'never settled on one PR',
+      'alice lists both pull requests — 1.4 keeps the approved one for "Ready to complete"',
+      listA?.length === 2 && openPr?.assignedToMe === true && donePr !== undefined,
+      listA ? listA.map((p) => `#${p.id} ${p.repoName}`).join(' ') : 'never settled on two PRs',
     )
-    const prKey = listA?.[0]?.key ?? 'repo-web:4271'
+    const prKey = openPr?.key ?? 'repo-web:4271'
+
+    const statusA = await alice.eval(`window.bridge.prs.status()`)
+    check(
+      'the status carries numeric overdue/stale counts and the team thresholds',
+      typeof statusA?.overdue === 'number' &&
+        typeof statusA?.stale === 'number' &&
+        statusA?.unseen === 1 &&
+        typeof statusA?.reviewSlaHours === 'number',
+      `unseen=${statusA?.unseen} overdue=${statusA?.overdue} stale=${statusA?.stale} sla=${statusA?.reviewSlaHours}h/${statusA?.staleAfterDays}d`,
+    )
 
     // Bob never typed a token: the shared one has to arrive over the share.
     const statB = await until(async () => {
@@ -1379,6 +1819,33 @@ async function main() {
     }, 30000)
     check('bob sees the same pull request', !!listB, listB ? `${listB.length} tracked` : 'timed out')
 
+    // The waiting state, computed on bob's own machine from the same two extra
+    // reads: one unresolved thread whose last word is the reviewer's, so the
+    // author is who everyone is waiting for.
+    const bobOpen = await until(async () => {
+      await bob.eval(`window.bridge.prs.refresh()`).catch(() => {})
+      const l = await bob.eval(`window.bridge.prs.list()`)
+      const p = l?.find((x) => x.id === 4271)
+      return p?.state?.threadsKnown === true ? p : undefined
+    }, 30000)
+    check(
+      "bob's open PR is 'comments-open', waiting on the author, with one open thread",
+      bobOpen?.state?.kind === 'comments-open' &&
+        bobOpen?.state?.next === 'author' &&
+        bobOpen?.state?.openThreads === 1 &&
+        bobOpen?.state?.threadsKnown === true,
+      bobOpen?.state
+        ? `${bobOpen.state.kind} · next=${bobOpen.state.next} (${bobOpen.state.nextNames.join(', ')}) · open=${bobOpen.state.openThreads} · known=${bobOpen.state.threadsKnown}`
+        : 'no state on the view',
+    )
+    const bobDone = listB?.find((p) => p.id === 4288)
+    const statusB = await bob.eval(`window.bridge.prs.status()`)
+    check(
+      'the approved pull request is listed as approved and left out of the unseen count',
+      bobDone?.state?.kind === 'approved' && bobDone?.state?.next === 'author' && statusB?.unseen === 1,
+      `${bobDone?.state?.kind} · next=${bobDone?.state?.next} · unseen=${statusB?.unseen}`,
+    )
+
     await alice.eval(`window.bridge.prs.markSeen([${JSON.stringify(prKey)}])`)
     const seenStat = await until(async () => {
       const s = await alice.eval(`window.bridge.prs.status()`)
@@ -1392,14 +1859,74 @@ async function main() {
       join(SHOTS, 'e2e-prs.png'),
     )
 
-    // Approve it upstream: it must fall out of the list on the next poll.
-    for (const p of ado.state.prs['repo-web']) p.reviewers = [{ ...ME_REVIEWER, vote: 10, isRequired: true }]
+    // Complete it upstream: a merged PR is the one thing that still leaves the
+    // list entirely (1.4 keeps approved ones, but not completed/abandoned).
+    for (const p of ado.state.prs['repo-web']) p.status = 'completed'
     const drained = await until(async () => {
       await alice.eval(`window.bridge.prs.refresh()`).catch(() => {})
       const l = await alice.eval(`window.bridge.prs.list()`)
-      return l?.length === 0 ? { empty: true } : undefined
+      return l?.some((p) => p.id === 4271) ? undefined : { gone: true }
     }, 30000)
-    check('an approved pull request drops out of the list', !!drained)
+    check('a completed pull request drops out of the list', !!drained)
+
+    // 1.4 — the quick notification controls, driven through the real bell in
+    // bob's sidebar footer. Pausing pull-request alerts there has to reach the
+    // in-app card, not just the OS notification: same setting, both surfaces.
+    const bellToggle = `(() => { const b = document.querySelector('button[aria-label^="Notifications"]'); if (!b) return false; b.click(); return true })()`
+    const pickPrAlerts = (label) =>
+      `(() => {` +
+      ` const d = document.querySelector('[role="dialog"][aria-label="Notifications"]'); if (!d) return false;` +
+      ` const r = d.querySelector('[role="radiogroup"][aria-label="Pull request alerts"] [role="radio"][title=${JSON.stringify(label)}]');` +
+      ` if (!r) return false; r.click(); return true })()`
+    const prCard = `Array.from(document.querySelectorAll('[role="alert"]')).some((n) => /pull request/i.test(n.textContent || ''))`
+
+    await bob.eval(bellToggle)
+    await sleep(400)
+    await bob.eval(pickPrAlerts('Paused'))
+    await sleep(600)
+    const pausedPrefs = await bob.eval(`window.bridge.settings.get()`)
+    soft(
+      "bob's notification bell pauses pull-request alerts",
+      pausedPrefs?.notifyPrs === 'none',
+      `notifyPrs=${pausedPrefs?.notifyPrs}`,
+    )
+    await bob.screenshot(join(SHOTS, 'e2e-notifications.png')).catch(() => {})
+    soft('notification controls screenshot', true, join(SHOTS, 'e2e-notifications.png'))
+    await bob.eval(bellToggle) // close the popover before watching for a card
+    await sleep(300)
+
+    ado.state.prs['repo-api'].push(
+      adoPr({
+        id: 4299,
+        repo: ADO_REPOS[1],
+        title: 'Quietly widen the retention sweep',
+        author: DANA,
+        source: 'dana/retention-widen',
+        target: 'release/24.9',
+        reviewers: [{ ...ME_REVIEWER, vote: 0, isRequired: true }],
+        ageH: 0,
+      }),
+    )
+    await bob.eval(`window.bridge.prs.refresh()`).catch(() => {})
+    const leaked = await until(async () => ((await bob.eval(prCard)) === true ? true : undefined), 8000, 500)
+    soft(
+      'a paused pull request raises no alert card',
+      leaked !== true,
+      leaked === true ? 'the card appeared anyway' : 'silent for 8s',
+    )
+
+    // Back to All, so the card check below still means what it always meant.
+    await bob.eval(bellToggle)
+    await sleep(400)
+    await bob.eval(pickPrAlerts('All'))
+    await sleep(600)
+    await bob.eval(bellToggle)
+    const restoredPrefs = await bob.eval(`window.bridge.settings.get()`)
+    soft(
+      'and turning them back on is one click away',
+      restoredPrefs?.notifyPrs === 'all',
+      `notifyPrs=${restoredPrefs?.notifyPrs}`,
+    )
 
     // A brand-new PR while bob is on a channel: the in-app alert card.
     ado.state.prs['repo-api'].push(
@@ -1433,6 +1960,145 @@ async function main() {
     await alice.screenshot(join(OUT, 'alice.png'))
     await bob.screenshot(join(OUT, 'bob.png'))
     console.log(`\nscreenshots: ${OUT}/alice.png ${OUT}/bob.png`)
+
+    // 1.4 — "Reset local data", then re-join from the same machine under the
+    // same name. The old registration never leaves the share (its signature is
+    // what keeps everything it signed verifiable), so the roster has to hide it
+    // the moment a successor appears — including on the re-joined client
+    // itself, where the record doing the superseding is the local one.
+    //
+    // Alice goes last on purpose: this kills her instance. A third profile with
+    // its own empty userData *is* the post-reset state, on the same machine, so
+    // the hostname and the machine fingerprint match exactly as they would.
+    const aliceOldId = selfA?.self?.deviceId
+    try { procA.kill() } catch {}
+    await sleep(2500)
+    procC = launch('alice2', 9335)
+    const alice2 = await connect(9335)
+    const subC = await alice2.eval(
+      `window.bridge.onboarding.submit({ sharePath: ${JSON.stringify(SHARE)}, passphrase: ${JSON.stringify(PASS)}, displayName: 'Alice', teamName: '' })`,
+    )
+    check('alice re-joins the team from the same machine with the same name', subC?.ok === true, subC?.error ?? '')
+    const selfC = await alice2.eval(`window.bridge.app.getBoot()`)
+    const aliceNewId = selfC?.self?.deviceId
+    check(
+      'the re-join is a new device identity, not the old one',
+      !!aliceNewId && !!aliceOldId && aliceNewId !== aliceOldId,
+      `${aliceOldId?.slice(0, 8)} -> ${aliceNewId?.slice(0, 8)}`,
+    )
+
+    // A killed instance normally leaves a goodbye beacon; if SIGTERM beat it,
+    // the old beacon has to go stale (PRESENCE.onlineWithinMs) before anything
+    // may call that device gone — hence the generous window.
+    const bobList = await until(async () => {
+      const list = await bob.eval(`window.bridge.presence.list()`)
+      const gone = list?.find((p) => p.deviceId === aliceOldId)
+      return gone?.departed === true && gone?.supersededBy === aliceNewId ? list : undefined
+    }, 75000)
+    check(
+      "bob hides alice's previous device once the new one registers",
+      !!bobList,
+      bobList ? 'departed + supersededBy on the first poll that saw both' : 'still listed after 75s',
+    )
+    check(
+      'bob is left with exactly one live Alice',
+      (bobList ?? []).filter((p) => p.name === 'Alice' && !p.departed).length === 1,
+      JSON.stringify((bobList ?? []).map((p) => `${p.name}${p.departed ? ' (departed)' : ''}`)),
+    )
+
+    const selfList = await until(async () => {
+      const list = await alice2.eval(`window.bridge.presence.list()`)
+      const gone = list?.find((p) => p.deviceId === aliceOldId)
+      return gone?.departed === true && gone?.supersededBy === aliceNewId ? list : undefined
+    }, 30000)
+    check(
+      'the re-joined client does not list its own predecessor either',
+      !!selfList,
+      selfList ? 'superseded by the local record' : 'the person still sees two of themselves',
+    )
+
+    // The sidebar is the surface the report was about. Bob keeps a row for the
+    // old device — his DM with it has history — and it says which one it is;
+    // alice2 has no history with it at all, so there is no row.
+    const dmLabels = (cdp) =>
+      cdp.eval(
+        `Array.from(document.querySelectorAll('button[aria-label^="Direct message"]')).map((n) => n.getAttribute('aria-label'))`,
+      )
+    const bobRows = await until(async () => {
+      const rows = await dmLabels(bob)
+      return rows?.some((r) => r.includes('(previous device)')) ? rows : undefined
+    }, 20000)
+    check(
+      "bob's DM with the old device stays, labelled (previous device)",
+      !!bobRows && bobRows.filter((r) => /^Direct message Alice,/.test(r)).length === 1,
+      JSON.stringify(bobRows ?? (await dmLabels(bob))),
+    )
+    const selfRows = await dmLabels(alice2)
+    check(
+      'the re-joined sidebar shows no empty DM with the device it replaced',
+      Array.isArray(selfRows) && !selfRows.some((r) => /Alice/.test(r)),
+      JSON.stringify(selfRows),
+    )
+    // TOFU flags a new device that claims a pinned display name — which is
+    // exactly what a re-join is. Getting this wrong leaves the person's real
+    // device wearing the red impersonation chip for good, everywhere, which
+    // is worse than the duplicate row it replaced.
+    const trustOfNewAlice = await until(async () => {
+      const list = await bob.eval(`window.bridge.presence.list()`)
+      const live = list?.find((p) => p.deviceId === aliceNewId)
+      return live?.trust ?? undefined
+    }, 20000)
+    check(
+      'bob does not flag the re-joined Alice as an impersonator',
+      trustOfNewAlice === 'pinned',
+      `trust=${trustOfNewAlice}`,
+    )
+
+    // The quick switcher lists people on the sidebar's terms now: the DM the
+    // sidebar deliberately keeps reachable has to be reachable from ⌘K too,
+    // under the same name.
+    // Two steps on purpose: React renders the option list on a later tick
+    // than the input event, and an unfocused E2E window does not always
+    // deliver a native focus event to React — so focus is dispatched
+    // explicitly, and the options are read on their own polling loop.
+    await bob.eval(
+      `(() => {
+         const i = document.querySelector('input[aria-label^="Quick switcher"]')
+         if (!i) return false
+         i.focus()
+         i.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+         i.dispatchEvent(new FocusEvent('focus'))
+         const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+         set.call(i, 'Alice')
+         i.dispatchEvent(new Event('input', { bubbles: true }))
+         return true
+       })()`,
+    )
+    const qsTitles = await until(async () => {
+      const titles = await bob.eval(
+        `Array.from(document.querySelectorAll('[role="option"]')).map((n) => n.getAttribute('title'))`,
+      )
+      return titles && titles.some((t) => t && t.includes('(previous device)')) ? titles : undefined
+    }, 20000)
+    check(
+      'the quick switcher can still reach the (previous device) DM',
+      !!qsTitles && qsTitles.filter((t) => t === 'Message Alice').length === 1,
+      JSON.stringify(qsTitles ?? []),
+    )
+    await bob.eval(
+      `(() => {
+         const i = document.querySelector('input[aria-label^="Quick switcher"]')
+         if (!i) return false
+         const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+         set.call(i, '')
+         i.dispatchEvent(new Event('input', { bubbles: true }))
+         i.blur()
+         return true
+       })()`,
+    )
+
+    await alice2.screenshot(join(SHOTS, 'e2e-rejoin.png')).catch(() => {})
+    soft('re-joined sidebar screenshot', true, join(SHOTS, 'e2e-rejoin.png'))
 
     // Janitor sweep smoke: place an ancient file in blobs and run a manual clean via touch -t
     const oldBlob = join(SHARE, 'Chat', 'blobs', 'aa', 'deadbeef.blob')

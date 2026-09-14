@@ -5,6 +5,7 @@ import type {
   CursorView,
   GroupView,
   HealthView,
+  LaunchInfo,
   PushMessage,
   SendDraft,
   SettingsView,
@@ -28,8 +29,23 @@ export interface TypingMap {
   [deviceId: string]: number // until (share-clock ms)
 }
 
+/**
+ * The Settings modal's left nav. Lives here rather than in the component
+ * because the modal is opened from three places now — the sidebar gear, the
+ * notifications popover ("All notification settings…") and the launch nudge —
+ * and only the last of those can reach the component's own state (1.4).
+ */
+export type SettingsSection = 'profile' | 'appearance' | 'notifications' | 'privacy' | 'quickMessages' | 'storage' | 'about'
+
 interface ChatStore {
   boot: BootMode | null
+  /**
+   * A sentence the unlock screen shows above its passphrase field, set when
+   * something sent the user back there. Today that is exactly one thing:
+   * onboarding refusing to set up over local data this machine already holds
+   * and nobody has unlocked ('locked-profile' — see AppController.onboardSubmit).
+   */
+  unlockNotice: string | null
   channels: ChannelView[]
   /** Private groups this device belongs to (1.2) — full replace on every `groups` push. */
   groups: GroupView[]
@@ -51,7 +67,14 @@ interface ChatStore {
    * Same guard `channelsSeq`/`groupsSeq` have had since 1.2.
    */
   teamSeq: number
+  /** Everyone else on the team folder — never this device (see `selfPresence`). */
   presence: PresenceView[]
+  /**
+   * 1.4 — this device's own row, which `presence` deliberately excludes (every
+   * list that walks it is a list of other people). Null until the session is
+   * up; the footer's status line and presence dot read it.
+   */
+  selfPresence: PresenceView | null
   events: Record<string, VerifiedEvent[]> // conv -> raw events (sorted on insert)
   eventsLoaded: Record<string, boolean>
   typing: Record<string, TypingMap>
@@ -61,6 +84,17 @@ interface ChatStore {
   outboxQueued: number
   activeConv: ConvId | null
   settings: SettingsView | null
+  /** 1.4 — the Settings modal: which section it is open on, or null when it is closed. */
+  settingsSection: SettingsSection | null
+  /** 1.4 — login-item + notification-support facts, for LaunchNudge and Settings. */
+  launchInfo: LaunchInfo | null
+  /**
+   * 1.4 — "Not now" on the launch nudge. Store state rather than the card's
+   * own `useState` so it survives an AppShell remount: the ask was one
+   * suggestion *per launch*, and a remount is not a new launch. Nothing
+   * persists it, so a real restart brings the card back.
+   */
+  launchNudgeDismissed: boolean
   beamOffers: BeamOfferView[]
   beamProgress: Record<string, BeamProgressView>
   blobs: Record<string, BlobFetchState>
@@ -83,6 +117,13 @@ interface ChatStore {
   prsPrefsOpen: boolean
 
   init(): Promise<void>
+  /**
+   * Leave onboarding for the unlock screen, carrying the reason. The boot mode
+   * comes from main (it knows whether the seal is passphrase-wrapped or beyond
+   * any build's reach); if it can't be reached, land on the passphrase card
+   * anyway — being sent here at all means this profile is sealed and locked.
+   */
+  showUnlockScreen(notice: string): Promise<void>
   /** Everything team-scoped: channels, people, own read marks; then every log for badges. */
   loadTeam(): Promise<void>
   setActiveConv(conv: ConvId | null): void
@@ -99,6 +140,13 @@ interface ChatStore {
   /** A live board is over — the host ended it, or a join found no directory. */
   markBoardEnded(sessionId: string): void
   refreshSettings(): Promise<void>
+  /** 1.4 — open the Settings modal, optionally straight on one of its sections. */
+  openSettings(section?: SettingsSection): void
+  closeSettings(): void
+  /** 1.4 — re-read after setOpenAtLogin or testNotification change the OS state. */
+  refreshLaunchInfo(): Promise<void>
+  /** 1.4 — "Not now": hide the launch nudge for the rest of this launch. */
+  dismissLaunchNudge(): void
 }
 
 /**
@@ -171,12 +219,14 @@ function checkConvVanish(get: () => ChatStore, prevChannels: ChannelView[], prev
 
 export const useStore = create<ChatStore>((set, get) => ({
   boot: null,
+  unlockNotice: null,
   channels: [],
   groups: [],
   channelsSeq: 0,
   groupsSeq: 0,
   teamSeq: 0,
   presence: [],
+  selfPresence: null,
   events: {},
   eventsLoaded: {},
   typing: {},
@@ -186,6 +236,9 @@ export const useStore = create<ChatStore>((set, get) => ({
   outboxQueued: 0,
   activeConv: null,
   settings: null,
+  settingsSection: null,
+  launchInfo: null,
+  launchNudgeDismissed: false,
   beamOffers: [],
   beamProgress: {},
   blobs: {},
@@ -203,7 +256,9 @@ export const useStore = create<ChatStore>((set, get) => ({
       const s = get()
       switch (msg.kind) {
         case 'boot':
-          set({ boot: msg.boot })
+          // The notice belongs to one visit to the unlock screen; anything
+          // that moves the boot mode off 'locked' has answered it.
+          set({ boot: msg.boot, unlockNotice: msg.boot.mode === 'locked' ? s.unlockNotice : null })
           if (msg.boot.mode === 'ready') {
             // Unlock / onboarding land here: same default as a cold start.
             void get().loadTeam()
@@ -218,6 +273,7 @@ export const useStore = create<ChatStore>((set, get) => ({
               channels: [],
               groups: [],
               presence: [],
+              selfPresence: null,
               events: {},
               eventsLoaded: {},
               typing: {},
@@ -270,6 +326,11 @@ export const useStore = create<ChatStore>((set, get) => ({
         }
         case 'presence':
           set({ presence: msg.views })
+          break
+        // 1.4 — our own row, off the local beacon: the status the footer shows
+        // and the dot next to our avatar.
+        case 'self-presence':
+          set({ selfPresence: msg.view })
           break
         case 'typing': {
           const conv = s.typing[msg.conv] ?? {}
@@ -326,7 +387,21 @@ export const useStore = create<ChatStore>((set, get) => ({
     set({ boot })
     const settings = await window.bridge.settings.get()
     set({ settings })
+    // 1.4 — OS-level facts, not team-scoped: safe to read regardless of boot
+    // mode, same as settings above.
+    set({ launchInfo: await window.bridge.app.launchInfo() })
     if (boot.mode === 'ready') await get().loadTeam()
+  },
+
+  async showUnlockScreen(notice: string) {
+    // Main is the authority on *which* unlock card (a passphrase the user
+    // has, versus a seal no build can open) — but not on whether to show one:
+    // it only ever refuses onboarding when this profile is sealed and locked.
+    const boot = await window.bridge.app.getBoot().catch(() => null)
+    set({
+      unlockNotice: notice,
+      boot: boot?.mode === 'locked' ? boot : { mode: 'locked', reason: 'passphrase' },
+    })
   },
 
   async loadTeam() {
@@ -336,15 +411,21 @@ export const useStore = create<ChatStore>((set, get) => ({
     // push that beat the fetch back is detected, not clobbered by the older
     // snapshot this function requested first.
     const channelsSeqAtStart = get().channelsSeq
-    const [channels, presence, myReads] = await Promise.all([
+    const [channels, presence, myReads, selfPresence] = await Promise.all([
       window.bridge.chat.channels(),
       window.bridge.presence.list(),
       window.bridge.chat.myReads(),
+      // Our own row (1.4). Pulled as well as pushed: main's 'self-presence'
+      // push goes out while the session starts, which is before this window is
+      // listening on a cold launch. Tolerant of a preload without it — the
+      // push then fills the footer in a moment later.
+      Promise.resolve(window.bridge.presence.self?.() ?? null).catch(() => null),
     ])
     set((s) => ({
       channels: s.channelsSeq === channelsSeqAtStart ? channels : s.channels,
       presence,
       myReads,
+      selfPresence: selfPresence ?? s.selfPresence,
     }))
     const liveChannels = get().channels
     if (liveChannels.length && !get().activeConv) get().setActiveConv(liveChannels[0].conv)
@@ -446,6 +527,22 @@ export const useStore = create<ChatStore>((set, get) => ({
 
   async refreshSettings() {
     set({ settings: await window.bridge.settings.get() })
+  },
+
+  openSettings(section = 'profile') {
+    set({ settingsSection: section })
+  },
+
+  closeSettings() {
+    set({ settingsSection: null })
+  },
+
+  async refreshLaunchInfo() {
+    set({ launchInfo: await window.bridge.app.launchInfo() })
+  },
+
+  dismissLaunchNudge() {
+    set({ launchNudgeDismissed: true })
   },
 }))
 

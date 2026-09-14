@@ -5,8 +5,8 @@ import { isChanConv, isTeamConv, sanitizeHostname } from '@shared/ids'
 import { sweepMsFor, tickMsFor, type IoTier } from '../services/ioTier'
 import { BeaconReader, type BeaconObservation } from './beacon'
 import type { EventStore } from './events'
-import type { RosterEntry } from './roster'
 import type { Session } from './session'
+import { supersededDevices } from './supersede'
 
 // Drives the whole read side: beacon polling, event ingestion via heads,
 // channel discovery, presence derivation, typing, and remote cursors.
@@ -235,7 +235,17 @@ export class Poller {
     }
     for (const [conv, heads] of plainHeads) {
       if (!isChanConv(conv) && !isTeamConv(conv)) continue
-      if (isChanConv(conv) && !s.channels.get(conv.slice(5))) await s.loadChannels()
+      if (isChanConv(conv) && !s.channels.get(conv.slice(5))) {
+        // One targeted read of that channel's metadata — the token comes from
+        // the conv id, so a head naming a channel nobody has loaded no longer
+        // costs a listing of every channel directory on the share.
+        const loaded = await s.ensureChannel(conv as ConvId)
+        // And tell the shell: this is the discovery path for a channel created
+        // while we were running, and the sweep below compares sizes *after*
+        // this ran — so without a nudge here the new channel sat in the
+        // session, fully loaded, without ever reaching the sidebar.
+        if (loaded) this.listeners.onNewDevice?.()
+      }
       // A tombstoned channel is closed: don't re-read a log on its way out.
       if (isChanConv(conv) && s.channels.get(conv.slice(5))?.deletedAt) continue
       await this.events.ingestHeads(conv as ConvId, heads)
@@ -285,7 +295,28 @@ export class Poller {
   presenceViews(): PresenceView[] {
     const s = this.session
     const shareNow = s.io.calibratedNow()
-    const entries = s.roster.all().filter((e) => e.record.deviceId !== s.deviceId)
+    const all = s.roster.all()
+    // Superseded registrations are computed over the WHOLE roster — this
+    // device's own record included, even though it never gets a view of its
+    // own. After "Reset local data" + re-join it is the local record that
+    // supersedes the leftover one, so leaving it out is exactly how a person
+    // ends up looking at two of themselves (1.4).
+    // …and only once a beacon listing has been read: the rule's one veto (the
+    // predecessor is still beaconing) can only be exercised after that, so
+    // before it every device on the share looks dead. See `departed`.
+    const superseded = !this.polled
+      ? new Map<string, string>()
+      : supersededDevices(
+          all.map((e) => ({
+            deviceId: e.record.deviceId,
+            displayName: e.record.displayName,
+            hostname: e.record.hostname,
+            machineIdHash: e.record.machineIdHash,
+            firstSeen: e.record.firstSeen,
+            live: this.beaconLive(e.record.deviceId, shareNow),
+          })),
+        )
+    const entries = all.filter((e) => e.record.deviceId !== s.deviceId)
     const views: PresenceView[] = []
 
     for (const entry of entries) {
@@ -314,7 +345,16 @@ export class Poller {
       }
       // Departed devices stay in the list (flagged) so their old messages
       // keep a name and an unread DM from them still has a row to open.
-      const departed = state === 'offline' && this.departed(entry, lastSeenMs, shareNow, entries)
+      // Supersession is not gated on `state` (it carries its own, stricter
+      // liveness test): a leftover registration whose goodbye beacon is two
+      // minutes from going stale is still a person listed twice for those two
+      // minutes, and nothing about it is coming back.
+      const supersededBy = superseded.get(deviceId)
+      const departed = this.departed(lastSeenMs, shareNow, supersededBy)
+      // A superseded identity cannot come back — its keys are gone — so its
+      // leftover beacon must not paint a green dot next to the one row that
+      // still shows it (the DM that holds its history).
+      if (supersededBy) state = 'offline'
       views.push({
         deviceId,
         name: obs?.content.name ?? entry.pin.displayName,
@@ -329,32 +369,54 @@ export class Poller {
         // evidence, and it is what the update banner reads.
         app: obs?.verified ? obs.content.app : undefined,
         departed,
+        ...(supersededBy ? { supersededBy } : {}),
       })
     }
     return views
   }
 
   /**
-   * A registration nobody is behind any more: no beacon at all (the janitor
-   * swept it, or the device never came back after a reset), quiet for longer
-   * than a long weekend, or plainly superseded — the same person on the same
-   * machine set up again, so this identity will never sign anything again.
-   * Only a hide: the roster entry stays, so its old messages still verify and
-   * the row is back the moment the device is.
+   * Is somebody behind this device *right now*: a heartbeat fresher than
+   * `onlineWithinMs` that doesn't say goodbye. Both sides of that comparison
+   * are share-clock values, which is the whole point — it is the one question
+   * `supersede.ts` needs answered and the one it must not ask itself, since a
+   * record's `firstSeen` is written on its author's local clock.
+   *
+   * Deliberately stricter than `state !== 'offline'`: that tolerates two
+   * minutes of silence, and this is the guard standing between a leftover
+   * registration and being hidden.
    */
-  private departed(entry: RosterEntry, lastSeenMs: number | null, shareNow: number, all: RosterEntry[]): boolean {
-    if (!this.polled) return false // before the first listing, absence means nothing yet
+  private beaconLive(deviceId: string, shareNow: number): boolean {
+    const obs = this.observations.get(deviceId)
+    if (!obs || obs.content.presence.state === 'offline') return false
+    return shareNow - Math.min(obs.content.hlc, shareNow) < PRESENCE.onlineWithinMs
+  }
+
+  /**
+   * A registration nobody is behind any more: plainly superseded — the same
+   * person on the same machine set up again, so this identity will never sign
+   * anything again (`supersede.ts`) — or no beacon at all (the janitor swept
+   * it, or the device never came back after a reset), or quiet for longer than
+   * a long weekend. Only a hide: the roster entry stays, so its old messages
+   * still verify and the row is back the moment the device is.
+   *
+   * Nothing is judged before the first beacon listing, supersession included.
+   * A successor record on its own looks like evidence — but the rule that
+   * reads it is only sound because a live predecessor can veto it, and that
+   * veto is a beacon: until one listing has been read, `beaconLive` is false
+   * for every device on the share. Answering early would take the two-live-
+   * instances case (two dev profiles on one machine under one name) and call
+   * the older one somebody's "(previous device)" on every client's very first
+   * `presence:list` — the renderer issues one in `loadTeam`, before our first
+   * tick lands. The cost of waiting is one poll (1 s focused) on the client
+   * that just re-joined; the cost of not waiting is a wrong answer about a
+   * device that is right there.
+   */
+  private departed(lastSeenMs: number | null, shareNow: number, supersededBy: string | undefined): boolean {
+    if (!this.polled) return false // before the first listing, nothing here means anything yet
+    if (supersededBy) return true
     if (lastSeenMs === null) return true
-    if (shareNow - lastSeenMs > PRESENCE.departedAfterMs) return true
-    const r = entry.record
-    return all.some(
-      (o) =>
-        o !== entry &&
-        o.record.firstSeen > r.firstSeen &&
-        o.record.displayName === r.displayName &&
-        sanitizeHostname(o.record.hostname) === sanitizeHostname(r.hostname) &&
-        (!o.record.machineIdHash || !r.machineIdHash || o.record.machineIdHash === r.machineIdHash),
-    )
+    return shareNow - lastSeenMs > PRESENCE.departedAfterMs
   }
 
   private emitPresence(): void {

@@ -1,5 +1,6 @@
 import type { AdoError, AdoErrorCode, AdoResult } from '@shared/types'
-import type { AdoPullRequest } from '@shared/prs'
+import type { AdoIteration, AdoPullRequest, AdoThread } from '@shared/prs'
+import { PRS } from '@shared/constants'
 
 // Azure DevOps REST client. Deliberately dependency-free and transport-free:
 // every request goes through an injected `FetchLike`, which main binds to
@@ -46,6 +47,30 @@ export interface AdoRepo {
   id: string
   name: string
   defaultBranch: string
+}
+
+/**
+ * The answer for a resource an older server simply does not have (1.4):
+ * threads and iterations arrive in REST 3.0 (TFS 2017), and a 2.0/1.0 server
+ * is not broken, it is just old. `unsupported` is its own arm so the pane can
+ * say "comment status is unavailable here" instead of painting an error strip
+ * the team can do nothing about.
+ */
+export type AdoDetail<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: 'unsupported' }
+  | { ok: false; reason: 'error'; error: AdoError }
+
+/** "4.1" ≥ "3.0" — numeric per component, never a string compare ("10.0" < "3.0"). */
+export function apiAtLeast(version: string, min: string): boolean {
+  const a = String(version).split('.')
+  const b = String(min).split('.')
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = Number.parseInt(a[i] ?? '0', 10) || 0
+    const y = Number.parseInt(b[i] ?? '0', 10) || 0
+    if (x !== y) return x > y
+  }
+  return true
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -259,6 +284,47 @@ export class AdoClient {
     for (const raw of listOf(res.value.body)) {
       if (typeof raw.pullRequestId !== 'number') continue
       out.push(raw as unknown as AdoPullRequest)
+    }
+    return { ok: true, value: out }
+  }
+
+  /**
+   * True while the negotiated version still has threads/iterations. Checked
+   * before the request (no point spending a round trip to be told 400) and
+   * again after a failure, because the ladder can step *below* 3.0 while a
+   * call is in flight — that refusal is a fact about the server, not an error.
+   */
+  private hasDetails(): boolean {
+    return apiAtLeast(this.version, PRS.minApiForThreads)
+  }
+
+  /** Comment threads of one pull request (1.4). */
+  async threads(project: string, repoId: string, prId: number): Promise<AdoDetail<AdoThread[]>> {
+    return this.detail(
+      `/${encodeURIComponent(project)}/_apis/git/repositories/${encodeURIComponent(repoId)}/pullRequests/${encodeURIComponent(String(prId))}/threads`,
+      (raw) => (typeof raw.id === 'number' ? (raw as unknown as AdoThread) : null),
+    )
+  }
+
+  /** Pushed revisions of one pull request; the newest is the last push (1.4). */
+  async iterations(project: string, repoId: string, prId: number): Promise<AdoDetail<AdoIteration[]>> {
+    return this.detail(
+      `/${encodeURIComponent(project)}/_apis/git/repositories/${encodeURIComponent(repoId)}/pullRequests/${encodeURIComponent(String(prId))}/iterations`,
+      (raw) => (typeof raw.id === 'number' ? (raw as unknown as AdoIteration) : null),
+    )
+  }
+
+  private async detail<T>(path: string, pick: (raw: Record<string, unknown>) => T | null): Promise<AdoDetail<T[]>> {
+    if (!this.hasDetails()) return { ok: false, reason: 'unsupported' }
+    const res = await this.get(path, {})
+    if (!res.ok) {
+      if (!this.hasDetails()) return { ok: false, reason: 'unsupported' }
+      return { ok: false, reason: 'error', error: res.error }
+    }
+    const out: T[] = []
+    for (const raw of listOf(res.value.body)) {
+      const v = pick(raw)
+      if (v !== null) out.push(v)
     }
     return { ok: true, value: out }
   }

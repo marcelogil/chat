@@ -65,25 +65,53 @@ the only thing every machine can reach is an SMB share.
   encrypted folder as everything else.
 - **Pull requests** — watch Azure DevOps repos from inside Chat: a red
   sidebar badge and popup when a PR needs your review, filters (assigned to
-  me / mine / by branch), and a PR drops off the list automatically once
-  it's approved. The watched repo list can be edited any time — Chat
-  re-checks the saved connection on its own, no re-pasting a token.
+  me / mine / by branch), and every pull request shows who it's waiting on
+  and for how long — the reviewers, the author, or whoever opened a comment
+  thread the author hasn't answered yet. An approved pull request stays
+  listed under "Ready to complete" instead of disappearing, and one with no
+  activity for 14+ days is called out as stale; both thresholds live in the
+  PR settings. The watched repo list can be edited any time — Chat re-checks
+  the saved connection on its own, no re-pasting a token.
+- **Notification controls** — a bell in the sidebar and in the pull-request
+  pane gives quick control over both: pull requests (All / Only mine /
+  Paused) and chat (Everything / Only about me / Nothing), plus a one-click
+  pause for 1 hour or until 9:00 the next morning. Quiet hours (set in
+  Settings) are honoured everywhere this covers — chat, pull requests, and
+  the in-app pull-request alert alike; a beam offer still comes through
+  regardless, since someone on the other end is waiting for an answer.
+
+## How messages are secured (even from someone with the passphrase)
 
 Everything written to the share is AES-256-GCM encrypted and bound to its
-location (a moved, renamed, or replayed file fails authentication). The team
-passphrase (scrypt, 128 MiB) is the only secret to distribute — in person.
+location — a moved, renamed, or replayed file fails authentication — and every
+record is Ed25519-signed, which is what the chip beside a name (`MBP-ANA·Q7RC`)
+reports: the hostname plus a fingerprint of the key that actually signed the
+message. It can't be typed or chosen, and a new device claiming a known name is
+flagged.
 
-Local data (your device key, cached messages) is encrypted too. On Windows
-the key is sealed with DPAPI, silently. On macOS Chat deliberately
-stays out of the Keychain — ad-hoc-signed builds would trigger a "wants to
-use your confidential information" prompt on every update — so the local key
-is wrapped under the team passphrase (same scrypt cost) and you unlock the
-app when it opens. The trade: on a Mac, a copy of the profile folder plus the
-team passphrase *is* that device's identity, including its DM key. Keep
-FileVault on. (Passphrase rotation is a v2 item; today, someone leaving the
-team means setting up a new team folder with a new passphrase.)
+The team passphrase (scrypt, 128 MiB) is the only secret to distribute — in
+person. It unlocks the team's shared side: channels, the calendar, the
+pull-request config (including a *shared* Azure DevOps token, if you use one),
+poll votes and live boards in channels. It does **not** unlock direct messages
+or private groups — and that isn't a rule anyone has to honour, those keys are
+never derived from it. A DM key comes from an X25519 handshake between the two
+devices' own keys, and the DM's directory name is derived from that key, so
+someone holding the passphrase can neither read a DM nor tell whose it is. A
+private group is a random key handed to each member inside their DM, living in a
+directory only a member can name; removing someone rotates it.
 
-## Developing (on the build Mac)
+Local data is encrypted too — DPAPI on Windows, wrapped under the team
+passphrase on macOS, where Chat deliberately stays out of the Keychain
+(ad-hoc-signed builds would trigger a "wants to use your confidential
+information" prompt on every update). The trade on a Mac: a copy of the profile
+folder *plus* the passphrase is that device's identity, including its DM key —
+keep FileVault on. Passphrase rotation is a v2 item; today, someone leaving the
+team means a new team folder with a new passphrase.
+
+The threat model, the caveats, and a table of who can read what:
+[`docs/security.md`](docs/security.md).
+
+## Developing
 
 ```bash
 npm install
@@ -128,7 +156,7 @@ folder itself (`/Volumes/TeamShare/Chat` — the path Settings shows); the
 script resolves the team root the same way the app does and refuses to
 publish into a folder with no `protocol.json`, since no client would poll it.
 
-Both platforms build on the Mac — no Windows machine, no wine (electron-
+Both zips are produced from macOS — no Windows machine, no wine (electron-
 builder ≥ 26 patches the exe with pure-JS resedit).
 
 **The release key.** `apps/version.json` is signed with an Ed25519 key the
@@ -152,6 +180,12 @@ banner the moment the signed manifest actually lands.
 Users install by copying a zip from `<share>/Chat/apps/`, extracting,
 and double-clicking. No installers, no scripts. `README-INSTALL.txt` is
 published alongside with the Gatekeeper/SmartScreen notes.
+
+The first time Chat opens — and every time after, until both are accepted —
+it suggests opening at login and allowing notifications (turn the suggestion
+off for good in Settings → Notifications). On a Mac, turning on "open at
+login" does not skip the unlock screen: the team passphrase is still asked
+for after every restart, login item or not (see the Keychain rule above).
 
 ## Before first deployment (de-risk checklist)
 

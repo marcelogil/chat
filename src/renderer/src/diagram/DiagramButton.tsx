@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { ConvId } from '@shared/types'
 import { useStore } from '@/store'
+import { NO_DRAG } from '@/app/chrome'
 import { IconButton } from '@/ui/atoms'
 
 // The composer's Diagram control. Lives here rather than inside Composer.tsx so
@@ -44,7 +45,9 @@ export function DiagramButton({ conv }: { conv: ConvId }) {
       </IconButton>
       {open && (
         <>
-          <div style={{ position: 'fixed', inset: 0, zIndex: 30 }} onMouseDown={() => setOpen(false)} />
+          {/* Spans the shell's drag strip, so it has to opt out of it — see
+              app/overlayChrome.ts. */}
+          <div style={{ ...NO_DRAG, position: 'fixed', inset: 0, zIndex: 30 }} onMouseDown={() => setOpen(false)} />
           <div
             className="sem-popover"
             role="menu"

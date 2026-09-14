@@ -51,6 +51,44 @@ backend is an encrypted shared folder (SMB) — there is no server. Read
   multibyte characters (`·`, `…`, `→`) under the default locale — use
   `LC_ALL=C grep -an …`.
 
+## Profiles and test runs
+
+**The default profile is a real person's device identity.** On this Mac that is
+`~/Library/Application Support/Chat` — `lmk.sealed` plus every `*.enc` secret
+under it (identity, roster pins, DM keys, team cache). Nothing on the share can
+rebuild it: destroy it and that device is gone, along with every DM ever sent
+to it.
+
+- **Any packaged run that is not the user's own MUST set
+  `CHAT_USER_DATA_DIR=/abs/scratch/dir`.** It is honoured in *every* build
+  (`resolveUserDataDir` in `src/main/userData.ts`, applied in `index.ts` before
+  anything reads `userData`), must be absolute, and may not be the default dir
+  itself; the app prints one line when it is active, and **refuses to start**
+  if it is set but unusable — falling back to the real profile in silence is
+  the accident this exists to prevent. `SEMAPHORE_PROFILE` is unchanged and
+  still **dev-only** (`npm run dev:a`/`dev:b`); a packaged build ignores it,
+  which is exactly how this went wrong.
+- **`onboarding.submit` refuses over a locked profile.** `onboardSubmit`
+  answers `{ ok: false, error: 'locked-profile', message }` when
+  `store.hasSealedData() && !store.unlocked` — before it touches the share —
+  and the renderer sends the person to the unlock screen with that sentence
+  (`store.showUnlockScreen`, `unlockNotice`, `UnlockScreen`'s `notice`).
+  `LocalStore.createPassphraseLmk` throws over any existing seal as the floor
+  under every caller.
+- **`app.resetLocalData()` is the only key-destroying path** — user-confirmed,
+  reachable only from the unlock screen, and it `wipe()`s the seal before any
+  new LMK exists. Nothing else may discard a sealed LMK.
+- **What happened (2026-09-14):** a packaged verification script called
+  `bridge.onboarding.submit({ sharePath: <temp>, passphrase: 'correct horse
+  battery staple', … })` against the default profile while it sat on the unlock
+  screen. `SEMAPHORE_PROFILE` did nothing in a packaged build, so it was the
+  real profile; `onboardSubmit` saw `!unlocked` and called
+  `createPassphraseLmk`, sealing a *new* LMK over the existing one. The old
+  `identity.enc`/`pins.enc`/caches became unreadable, a fresh identity was
+  generated, and the device was destroyed. Tests:
+  `src/main/appController.test.ts`, `src/main/userData.test.ts`, the
+  "a sealed profile is not overwritable" block in `store/localStore.test.ts`.
+
 ## Known deferred items (v2 candidates)
 
 In-app passphrase rotation (new epoch + LMK re-wrap; until
@@ -66,7 +104,11 @@ gives ~1–2 s latency, which is fine for a whiteboard today) · per-person,
 not per-device, poll votes (1.3 counts one vote per device — a roster record
 *is* a device, and nothing on the share binds two devices to one human; a
 "one vote per person" poll needs an identity layer Chat deliberately doesn't
-have).
+have) · an in-app card for author-side PR transitions (1.4's
+`PrService.trackTransitions`/`notifyTransitions` only ever raise an OS
+notification for "your PR was blocked / commented on / approved" — there is
+no in-app equivalent of `PrAlert` for these, so a focused window sees
+nothing until the pane itself is opened).
 
 ## GIF pack
 
@@ -372,3 +414,119 @@ from main that lands a beat after the request (so closing mid-transition would
 otherwise misjudge it), and it's equally true of a window the user had already
 put fullscreen before ever opening a diagram — that one isn't the editor's to
 undo either.
+
+## PR waiting states (1.4)
+
+`src/shared/prState.ts` (`computePrState`) decides who a pull request is
+waiting on and since when. Invariants an agent must keep:
+
+- **Pure, and no share I/O.** `computePrState` takes plain data and a
+  passed-in `now` — no Electron, no store, no clock of its own — so it runs
+  in a unit test with a fixed clock. The threads/iterations it reasons about
+  are two more per-PR Azure DevOps reads (`src/main/services/ado.ts`),
+  computed independently by every client from its own token; nothing about a
+  PR's waiting state is ever written to the share.
+- **Detail budget.** First sight of a PR and a changed
+  `lastMergeSourceCommit` jump the queue but are capped at `2 × ceil(N/5)`
+  PRs per poll; everything else round-robins at `ceil(N/5)` PRs per poll so
+  the whole tracked set refreshes within `PRS.detailRefreshMs` (5 min) —
+  never `2·N` serial requests in one poll (`PrService.refreshDetails`). A
+  failed detail read is retried once per refresh window, not every poll, and
+  never fails the poll itself; `unsupported` (server below REST 3.0) counts
+  as answered.
+- **`'prs-history'` is team-scoped.** Per-PR vote-observation times, pruned
+  to the tracked keys every poll, cleared alongside `'prs-seen'` on
+  `changeTeamFolder()` and `disconnect()`. `'prs-token'` (the personal PAT)
+  is the only PR secret that survives either.
+- **Thresholds carry forward.** `PrsConfig.reviewSlaHours`/`staleAfterDays`
+  are team-shared, additive fields; a snapshot that omits them (an ordinary
+  re-publish from a 1.3 client) keeps whatever is already in force rather
+  than reverting to the `PRS` constants — see `materializePrsConfig`. The
+  write path (`saveConfig`) refuses an out-of-range or non-integer value
+  instead of clamping it; only the read path off the share clamps, and it
+  clamps to the value already in force, not to the constant default.
+
+## Notification controls (1.4)
+
+- **Every toast/card decision goes through `shared/notifyDecision.ts`.**
+  `shouldNotifyChat`/`shouldNotifyPr` are the only gates
+  `ChatService.maybeNotify`, `PrService` and the renderer's `PrAlert` card
+  use — never re-derive "should this interrupt" locally, or the OS toast and
+  the in-app surface will disagree.
+- **Quiet hours are enforced there, and only there.** `inQuietHours()`
+  covers OS toasts for messages, live-board invites and pull requests, plus
+  the in-app PR alert card, without a single call site changing — it was
+  stored and rendered since earlier versions but silenced nothing before
+  1.4. It fails toward *not* silencing (a bad time or an unknown zone reads
+  as off), since the function can only ever suppress.
+- **Beam offers are exempt, on purpose** (`drops.ts` raises its own
+  `Notification` directly, outside this gate) — someone is waiting at the
+  other end of a transfer, and a silent expiry is worse than a chime during
+  quiet hours or a pause.
+
+## Launch nudge (1.4)
+
+- **Login item options must be identical on write and read.**
+  `setLoginItemSettings`/`getLoginItemSettings` only agree when called with
+  the same options; `app:setOpenAtLogin` and `app:launchInfo` both route
+  through the one `loginItemOptions(platform)` in `src/main/loginItem.ts` —
+  never add an `args`/`path` to one side without the other, or the toggle
+  silently reads back off (exactly the bug this shape fixes: the item was
+  registered with an argv flag nothing consumed, and read back with none).
+- **`requires-approval` counts as on.** macOS 13+ can register the login
+  item and still gate it behind System Settings → General → Login Items;
+  `launchInfoFrom` reads that status as `openAtLogin: true` (there is
+  nothing left to turn on), and both `LaunchNudge` and Settings show the
+  approval hint instead of a "Turn on" button.
+
+## Superseded devices (1.4)
+
+A roster record is never deleted (its signature keeps everything that device
+signed verifiable), so "Reset local data" + re-join leaves **two** records for
+one person on one machine. `src/main/transport/supersede.ts` decides which is
+the ghost — same normalized display name, same `sanitizeHostname`, machine
+fingerprints equal or absent, later `firstSeen`, predecessor not beaconing —
+and `Poller.presenceViews()` marks it `departed` with `PresenceView.supersededBy`.
+
+- **Feed the rule the whole roster, `self` included.** It used to run over the
+  list the views are built from, which filters `self` out — so on the client
+  that just re-joined, the record doing the superseding was the one record
+  excluded, and the person saw two of themselves for `PRESENCE.departedAfterMs`
+  (three days). That was the bug report.
+- **Never compare a beacon stamp with a `firstSeen`.** Beacon stamps are
+  share-calibrated; `firstSeen` is the writer's own wall clock. `supersede.ts`
+  takes a `live` boolean the poller answers in share time (`beaconLive`) —
+  a fresh heartbeat that isn't a goodbye. That guard is the only thing keeping
+  two same-named dev instances on one machine from hiding each other.
+- Every surface that lists people filters `departed`; new ones must too. The
+  sidebar goes further (`app/peopleRows.ts`): a superseded device is listed
+  only when its DM holds history, labelled "(previous device)", because that
+  history lives under a different pair key and can never move to the new
+  device's DM. Name-resolution maps (ChatPane, PollTile, calendar, boards)
+  must keep reading the *unfiltered* list — old messages still need a name.
+- **Never judge before the first beacon listing.** `Poller.departed()` and the
+  `supersededBy` it reports both sit behind `!this.polled`: the rule's one veto
+  is a live predecessor's heartbeat, and until a listing is read every device
+  looks dead. The renderer asks for `presence:list` in `loadTeam`, inside that
+  window.
+- **A re-join is not impersonation.** TOFU flags a new device that claims a
+  pinned display name, which is what a re-join *is*, so the person's real
+  device used to come back `trust: 'flagged'` — the loud red chip, everywhere,
+  for good. `Roster.nameCollision` skips a pin that is the provably same
+  machine (`provenSameMachine`: equal, **present** `machineIdHash`; a missing
+  fingerprint keeps the warning), and `Roster.healFlags()` re-asks at the end
+  of every `refresh()` so load order and pre-1.4 pins can't leave one standing.
+  Only `flagged` is ever relaxed.
+- **The group dialog keeps the ghost on purpose** — a membership is a list of
+  device ids, the old one still holds a key, and the owner has to be able to
+  remove it. It labels the row instead (`memberRowSuffix` →
+  "Gil (previous device)", Remove button included). It is the only people-list
+  that doesn't hide a superseded device; the members rail still does.
+- **The ≤50 s window is load-bearing, not a bug.** A predecessor killed without
+  a goodbye beacon stays "live" until its heartbeat passes
+  `PRESENCE.onlineWithinMs`, and that can't be tightened — an idle live
+  instance beacons only every `BEACON.idleHeartbeatMs` (45 s). Anything that
+  turns a *name* into one device (mention roster + picker, quick switcher,
+  group add-member picker) must therefore run through
+  `app/twinDevices.ts::preferFreshestTwin` first: freshest beacon wins, and
+  rows already carrying `supersededBy` pass through untouched.

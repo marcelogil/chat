@@ -261,6 +261,50 @@ describe('LocalStore with an OS keystore (Windows / DPAPI)', () => {
   })
 })
 
+describe('a sealed profile is not overwritable', () => {
+  // The floor under AppController.onboardSubmit (see appController.test.ts for
+  // the flow, and CLAUDE.md → "Profiles and test runs" for what it cost to
+  // learn): a second LMK over an existing seal doesn't "re-set-up" a machine,
+  // it destroys the device identity sealed under the first one. Only wipe() —
+  // reached from the user-confirmed reset — may do that.
+  it('refuses a second LMK over an existing seal, locked or not', () => {
+    const a = new LocalStore(dir, null)
+    a.init()
+    a.createPassphraseLmk('the real passphrase')
+    a.writeSecretJson('identity', { ed: 'the-real-device' })
+    const seal = readFileSync(join(dir, 'lmk.sealed'))
+
+    // Still unlocked in this process…
+    expect(a.hasSealedData()).toBe(true)
+    expect(() => a.createPassphraseLmk('something else')).toThrow(/sealed data/)
+
+    // …and in the dangerous case: a fresh launch that hasn't been unlocked.
+    const b = new LocalStore(dir, null)
+    expect(b.init()).toBe('passphrase')
+    expect(b.unlocked).toBe(false)
+    expect(b.hasSealedData()).toBe(true)
+    expect(() => b.createPassphraseLmk('something else')).toThrow(/sealed data/)
+
+    // Nothing was touched on the way out, so the device still opens.
+    expect(readFileSync(join(dir, 'lmk.sealed')).equals(seal)).toBe(true)
+    expect(b.unlockWithPassphrase('the real passphrase')).toBe(true)
+    expect(b.readSecretJson('identity')).toEqual({ ed: 'the-real-device' })
+  })
+
+  it('wipe() is the way through, and hasSealedData() says so', () => {
+    const a = new LocalStore(dir, null)
+    expect(a.hasSealedData()).toBe(false)
+    a.init()
+    a.createPassphraseLmk('first')
+    expect(a.hasSealedData()).toBe(true)
+
+    a.wipe()
+    expect(a.hasSealedData()).toBe(false)
+    a.createPassphraseLmk('second') // the explicit reset path, and only it
+    expect(a.unlocked).toBe(true)
+  })
+})
+
 describe('derived plaintext under userData', () => {
   it('the decrypted attachment cache goes with the seal, and on a team change', () => {
     const store = new LocalStore(dir, null)

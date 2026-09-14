@@ -47,3 +47,54 @@ export function notifyLineFor(input: NotifyLineInput): NotifyLine {
         : `${who} in #${convName || 'channel'}`
   return { title, body: snippet }
 }
+
+// ---------------------------------------------------------------------------
+// Pull requests (1.4)
+
+/** The three moves on *my own* pull request that are worth interrupting me for. */
+export type PrTransitionKind = 'changes-requested' | 'comments-open' | 'approved'
+
+export interface PrTransitionInput {
+  kind: PrTransitionKind
+  /** The pull-request number, as Azure DevOps shows it. */
+  id: number
+  /** The pull request's own title, and the repository it sits in — the body line. */
+  title: string
+  repoName: string
+  /** Display names of the reviewers who requested the changes. Only read for 'changes-requested'. */
+  by: string[]
+  /** Unresolved threads. Only read for 'comments-open'. */
+  openThreads: number
+}
+
+/** "Ana" · "Ana and Bob" · "Ana and 2 others" — never a comma salad in a toast title. */
+function nameList(names: string[]): string {
+  const list = names.filter((n) => n.trim() !== '')
+  if (list.length === 0) return ''
+  if (list.length === 1) return list[0]
+  if (list.length === 2) return `${list[0]} and ${list[1]}`
+  return `${list[0]} and ${list.length - 1} others`
+}
+
+/**
+ * What the app says when one of my own pull requests moves: someone blocked it,
+ * someone left comments on it, or it is finally ready to complete. The title
+ * carries the news and the body identifies the pull request, which is the other
+ * way round from an arriving PR ("Pull request #42 · api" / "title — author")
+ * — for my own work the *change* is the surprising part, not which PR it is.
+ *
+ * Unlike a message, nothing here is a preview of someone's writing: it is the
+ * state of my own pull request, so `notifyPreviews` does not apply.
+ */
+export function prTransitionLine(input: PrTransitionInput): NotifyLine {
+  const body = `${input.title} · ${input.repoName}`
+  if (input.kind === 'approved') {
+    return { title: `Your PR #${input.id} is approved — ready to complete`, body }
+  }
+  if (input.kind === 'comments-open') {
+    const n = Math.max(1, input.openThreads)
+    return { title: `Your PR #${input.id} has ${n} open comment${n === 1 ? '' : 's'}`, body }
+  }
+  const who = nameList(input.by)
+  return { title: `Your PR #${input.id} — changes requested${who ? ` by ${who}` : ''}`, body }
+}

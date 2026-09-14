@@ -4,6 +4,8 @@ import { basename, join } from 'node:path'
 import { rmSync } from 'node:fs'
 import type { BootMode, OnboardHealth, PushMessage, SelfView, SettingsView } from '@shared/bridge'
 import { APP, DIR } from '@shared/constants'
+import { restoredBeaconPresence, statusFromSettings } from '@shared/presenceStatus'
+import { normalizeQuickMessages } from '@shared/quickMessages'
 import { LocalStore } from './store/localStore'
 import { platformKeystore } from './store/osKeystore'
 import { ShareIo } from './transport/shareIo'
@@ -41,6 +43,19 @@ interface CachedTeam {
   epoch: number
 }
 
+/**
+ * onboardSubmit's refusal code for "this profile is already someone's device,
+ * and it is locked". Machine-readable on purpose: the renderer routes on it
+ * (straight to the unlock screen) rather than pattern-matching a sentence, and
+ * a script driving the bridge can tell this apart from a bad passphrase.
+ */
+export const LOCKED_PROFILE = 'locked-profile'
+
+/** The sentence the renderer shows for {@link LOCKED_PROFILE}. */
+export const LOCKED_PROFILE_MESSAGE =
+  `This ${process.platform === 'darwin' ? 'Mac' : 'computer'} already holds Chat data. ` +
+  'Unlock it with your passphrase first, or choose Reset local data to start over as a new device.'
+
 const DEFAULT_SETTINGS: SettingsView = {
   theme: 'system',
   notifyChannels: 'mentions',
@@ -49,6 +64,22 @@ const DEFAULT_SETTINGS: SettingsView = {
   autoAcceptBeams: false,
   quietHours: { enabled: false, from: '18:30', to: '09:00' },
   fontSize: 'M',
+  // 1.4 — the launch nudge defaults to on; notifications default to
+  // not-yet-accepted since app:testNotification is the only thing that flips it.
+  suggestAtLaunch: true,
+  notificationsAccepted: false,
+  // 1.4 — the quick notification controls. Every default is what the app did
+  // before they existed: all pull requests alert, DMs and private groups
+  // notify, nothing is paused.
+  notifyPrs: 'all',
+  notifyDms: true,
+  snoozeUntil: null,
+  // null = the built-in quick-reply defaults (shared/quickMessages.ts);
+  // set once someone edits the list in Settings → Quick messages.
+  quickMessages: null,
+  // 1.4 — the status line under your name. Empty until someone sets one; the
+  // beacon is memory only, so this file is what carries it across a restart.
+  status: '',
 }
 
 export class AppController {
@@ -131,7 +162,17 @@ export class AppController {
   }
 
   setSettings(patch: Partial<SettingsView>): SettingsView {
-    this.settings = { ...this.settings, ...patch }
+    const next = { ...this.settings, ...patch }
+    // Quick messages are the only setting that arrives as a list, so they are
+    // the only one that can arrive over-long. Cap and clean them here as well
+    // as in the editor, so what lands in settings.json can never exceed the
+    // row's `maxEntries` — and a list that cleans away to nothing is stored as
+    // null, the "use the defaults" value the renderer already understands.
+    if (Array.isArray(next.quickMessages)) {
+      const clean = normalizeQuickMessages(next.quickMessages)
+      next.quickMessages = clean.length > 0 ? clean : null
+    }
+    this.settings = next
     this.store.writeSettings(this.settings)
     return this.settings
   }
@@ -232,6 +273,8 @@ export class AppController {
       'outbox',
       'read-cursors',
       'prs-seen',
+      // Observed vote times for this team's pull requests (1.4).
+      'prs-history',
       // Private-group keys and membership are this team's secrets (1.2).
       'groups',
     ]) {
@@ -310,7 +353,16 @@ export class AppController {
     passphrase: string
     displayName: string
     teamName: string
-  }): Promise<{ ok: true } | { ok: false; error: string }> {
+  }): Promise<{ ok: true } | { ok: false; error: string; message?: string }> {
+    // Before anything touches the share: this machine may already hold a
+    // device identity nobody has unlocked this launch. Setting up over it
+    // would seal a *new* LMK over the old one and make identity.enc, pins.enc
+    // and every cache permanently unreadable — the device would be gone and
+    // its DMs with it. Refuse; only app.resetLocalData(), which the user
+    // confirms on the unlock screen, may discard a sealed LMK.
+    if (this.store.hasSealedData() && !this.store.unlocked) {
+      return { ok: false, error: LOCKED_PROFILE, message: LOCKED_PROFILE_MESSAGE }
+    }
     try {
       const root = await this.teamRoot(cfg.sharePath)
       const io = new ShareIo(root)
@@ -325,6 +377,10 @@ export class AppController {
       // keystore it is also what seals the local data, and it's the one the
       // unlock screen will ask for at the next launch — so a changed team
       // folder (or a rotated passphrase) must re-wrap the existing LMK.
+      //
+      // The locked-with-a-seal case never reaches here (refused at the top of
+      // this method, and LocalStore throws under that anyway), so `!unlocked`
+      // means one thing only: a genuinely fresh profile with nothing to lose.
       if (!this.store.unlocked) this.store.createPassphraseLmk(cfg.passphrase)
       else this.store.rewrapPassphrase(cfg.passphrase)
       const config: AppConfig = { sharePath: root, displayName: cfg.displayName, teamName: proto.teamName }
@@ -390,6 +446,10 @@ export class AppController {
     this.session = session
     this.chat = new ChatService(session, this.getWindow, () => this.settings, () => app.getVersion())
     this.chat.setPush((msg) => this.push(msg))
+    // The status survives the quit (1.4): put the saved one back before
+    // `chat.start()` fires the first beacon, so teammates never see a blank
+    // line while this device catches up — and neither does the footer.
+    this.chat.beacon.presence = restoredBeaconPresence(this.chat.beacon.presence, statusFromSettings(this.settings))
     // Everything that hangs off a live ChatService gets built right here,
     // before the catch-up read and long before the ready `boot` push — see
     // onSessionChange. In particular the sfblob:// handler is live before the
@@ -412,7 +472,14 @@ export class AppController {
     this.updates.start()
     // After chat.start(): the PR service materializes its config from the
     // 'team:prs' log the startup catch-up has just filled in.
-    this.prs = new PrService(this.chat, this.store, this.getWindow, (msg) => this.push(msg), () => app.getVersion())
+    this.prs = new PrService(
+      this.chat,
+      this.store,
+      this.getWindow,
+      (msg) => this.push(msg),
+      () => app.getVersion(),
+      () => this.settings,
+    )
     this.prs.start()
 
     this.boot = { mode: 'ready', self: this.selfView(config, proto.teamName) }

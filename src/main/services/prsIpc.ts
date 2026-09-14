@@ -33,6 +33,11 @@ function repos(v: unknown): PrsRepo[] {
   return out
 }
 
+/** A renderer-supplied number, or undefined for anything that is not one (1.4). */
+function num(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
 function keys(v: unknown): string[] {
   if (!Array.isArray(v)) return []
   return v.slice(0, MAX_KEYS).filter((k): k is string => typeof k === 'string' && k.length > 0 && k.length <= MAX_STR)
@@ -72,7 +77,15 @@ export function registerPrsIpc(controller: AppController, getWindow: () => Brows
     'prs:saveConfig',
     async (
       _e,
-      input: { baseUrl: string; project: string; repos: PrsRepo[]; token: string; shareToken: boolean },
+      input: {
+        baseUrl: string
+        project: string
+        repos: PrsRepo[]
+        token: string
+        shareToken: boolean
+        reviewSlaHours?: number
+        staleAfterDays?: number
+      },
     ) => {
       await prs().saveConfig({
         baseUrl: text(input?.baseUrl, 2048),
@@ -80,6 +93,10 @@ export function registerPrsIpc(controller: AppController, getWindow: () => Brows
         repos: repos(input?.repos),
         token: text(input?.token, 1024),
         shareToken: input?.shareToken === true,
+        // Left undefined when absent so the service keeps the team's current
+        // value; a present-but-nonsense number is refused there, not coerced.
+        reviewSlaHours: num(input?.reviewSlaHours),
+        staleAfterDays: num(input?.staleAfterDays),
       })
     },
   )

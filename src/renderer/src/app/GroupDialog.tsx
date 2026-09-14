@@ -6,7 +6,9 @@ import { SectionLabel } from './chrome'
 import { trapTabWithin } from './ChannelMenu'
 import { IconLock, IconSearch, IconX } from './icons'
 import { toast } from './toasts'
-import { pickAddCandidates } from './groupMembers'
+import { memberRowSuffix, pickAddCandidates } from './groupMembers'
+import { PersonLines } from './PersonLines'
+import { presenceLine } from './presenceLine'
 
 // Private-group dialog (1.2): name + member picker from presence, chips,
 // search — reused for both "Add people…" and "Manage members…" (the latter
@@ -29,9 +31,13 @@ export function GroupDialog({
   onClose: () => void
 }) {
   const presence = useStore((s) => s.presence)
+  const selfPresence = useStore((s) => s.selfPresence)
   const boot = useStore((s) => s.boot)
   const setActiveConv = useStore((s) => s.setActiveConv)
   const self = selfOf(boot)
+  // Our own row in "Current members" reads the same self presence the footer
+  // does — `presence` is everyone else (1.4).
+  const selfState = selfPresence?.state ?? 'online'
 
   const [name, setName] = useState(group?.name ?? '')
   const [query, setQuery] = useState('')
@@ -203,28 +209,40 @@ export function GroupDialog({
                   const isOwner = id === group?.owner
                   const isSelf = id === self?.deviceId
                   const displayName = isSelf ? (self?.displayName ?? 'you') : (p?.name ?? `${id.slice(0, 8)}…`)
+                  // A device the same person replaced by re-joining (1.4) is
+                  // still on the membership list holding a key, so — unlike
+                  // the members rail — this dialog keeps its row and says
+                  // which device it is. `memberRowSuffix` carries that into
+                  // the name line and into the Remove button's label.
+                  const suffix = memberRowSuffix(p, { owner: isOwner, self: isSelf })
+                  const rowName = `${displayName}${suffix}`
+                  const rowState = isSelf ? selfState : (p?.state ?? 'offline')
+                  const rowStatus = isSelf ? selfPresence?.status : p?.status
+                  // Name and status only — never the identity chip: it is
+                  // hover/focus-revealed on purpose (see chrome.tsx), and a
+                  // screen reader reading this row's label shouldn't get it
+                  // read out every time regardless.
+                  const rowLabel = `${rowName}, ${presenceLine({ status: rowStatus, state: rowState, departed: p?.departed, self: isSelf }).text}`
                   return (
                     <div
                       key={id}
                       className="sem-row"
-                      style={{ height: 34, gap: 8, padding: '0 6px', borderRadius: 'var(--r-sm)' }}
+                      aria-label={rowLabel}
+                      style={{ height: 42, gap: 8, padding: '0 6px', borderRadius: 'var(--r-sm)' }}
                     >
-                      <Avatar name={displayName} size={22} presence={isSelf ? 'online' : p?.state} />
-                      <span
-                        style={{
-                          flex: 1,
-                          minWidth: 0,
-                          fontSize: 13,
-                          color: 'var(--text-1)',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {displayName}
-                        {isOwner ? ' · owner' : ''}
-                        {isSelf ? ' (you)' : ''}
-                      </span>
+                      <Avatar name={displayName} size={22} presence={isSelf ? selfState : p?.state} />
+                      {/* Name, then their status — the same two lines as
+                          every other person row (1.4). */}
+                      <PersonLines
+                        name={displayName}
+                        suffix={suffix}
+                        status={rowStatus}
+                        state={rowState}
+                        departed={p?.departed}
+                        hostname={isSelf ? self?.hostname : p?.hostname}
+                        fingerprint={isSelf ? self?.fingerprint : p?.fingerprint}
+                        warn={p?.trust === 'flagged'}
+                      />
                       {canRemove &&
                         !isOwner &&
                         !isSelf &&
@@ -250,8 +268,8 @@ export function GroupDialog({
                         ) : (
                           <button
                             className="sem-row sem-focus"
-                            title={`Remove ${displayName}`}
-                            aria-label={`Remove ${displayName}`}
+                            title={`Remove ${rowName}`}
+                            aria-label={`Remove ${rowName}`}
                             onClick={() => setRemoving(id)}
                             style={{
                               width: 22,
@@ -337,7 +355,8 @@ export function GroupDialog({
                   <label
                     key={p.deviceId}
                     className="sem-row"
-                    style={{ height: 32, gap: 8, padding: '0 8px', borderRadius: 'var(--r-sm)' }}
+                    aria-label={`${p.name}, ${presenceLine({ status: p.status, state: p.state, departed: p.departed }).text}`}
+                    style={{ height: 42, gap: 8, padding: '0 8px', borderRadius: 'var(--r-sm)' }}
                   >
                     <input
                       type="checkbox"
@@ -347,19 +366,15 @@ export function GroupDialog({
                       aria-label={`Include ${p.name}`}
                     />
                     <Avatar name={p.name} size={22} presence={p.state} desaturate={p.state === 'away'} />
-                    <span
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        fontSize: 13,
-                        color: 'var(--text-1)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {p.name}
-                    </span>
+                    <PersonLines
+                      name={p.name}
+                      status={p.status}
+                      state={p.state}
+                      departed={p.departed}
+                      hostname={p.hostname}
+                      fingerprint={p.fingerprint}
+                      warn={p.trust === 'flagged'}
+                    />
                   </label>
                 ))
               )}

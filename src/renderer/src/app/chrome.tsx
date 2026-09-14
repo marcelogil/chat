@@ -5,6 +5,14 @@ import type { CSSProperties, ReactNode } from 'react'
 export const DRAG = { WebkitAppRegion: 'drag' } as CSSProperties
 export const NO_DRAG = { WebkitAppRegion: 'no-drag' } as CSSProperties
 
+// Full-window overlays (diagram editor, lightbox, screen-share viewer) draw
+// their own top strip over the shell's drag strip — and Chromium works out the
+// draggable region from the DOM, not from z-order, so they have to opt out of
+// it control by control and dodge the OS chrome themselves. Re-exported here so
+// there is one import for all of it; the helper itself is pure (and tested) in
+// overlayChrome.ts, which is why it is not written inline in this .tsx.
+export { overlayChromeInsets, type ChromeInsets } from './overlayChrome'
+
 export const isMac = window.bridge.platform === 'darwin'
 export const modKey = isMac ? '⌘' : 'Ctrl'
 
@@ -121,6 +129,31 @@ const CSS = `
 .sem-row-hoverable:focus-within .sem-row-trigger,
 .sem-row-trigger[data-open='1'] { opacity: 1; pointer-events: auto; }
 .sem-row-hoverable:focus-within .sem-row-badge { display: none; }
+/* The identity chip on a person row (1.4): hostname·fingerprint is the answer
+   to "is this really them", not something to read all day, so it sits at the
+   end of the status line invisible and un-hittable until the row is hovered or
+   focused. Opacity rather than display keeps the status line's layout still,
+   and pointer-events:none keeps the chip's tooltip out of the way until it is
+   actually on screen. visibility rides along with opacity (delayed on the
+   way out, immediate on the way in) so the chip is also out of the
+   accessibility tree and tab order while hidden, not just invisible — a screen
+   reader stepping through the row no longer announces a chip nobody can see.
+   A flagged chip never gets this class — see PersonLines. */
+.sem-chip-reveal {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--t-fast) var(--ease-standard), visibility 0s linear var(--t-fast);
+}
+.sem-row:hover .sem-chip-reveal,
+.sem-row:focus-visible .sem-chip-reveal,
+.sem-reveal-host:hover .sem-chip-reveal,
+.sem-reveal-host:focus-within .sem-chip-reveal {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity var(--t-fast) var(--ease-standard);
+}
 .sem-frost {
   background: color-mix(in srgb, var(--bg-raised) 86%, transparent);
   backdrop-filter: blur(20px) saturate(1.2);

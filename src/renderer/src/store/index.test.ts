@@ -6,6 +6,17 @@ import { TEAM_CONV } from '@shared/constants'
 // The store talks to the preload bridge only through `window.bridge`, so the
 // whole push path is testable in the node env with a stub bridge.
 
+// 1.4 — store.init() also reads launchInfo alongside settings now. These
+// tests are about push routing, not the launch nudge itself (see
+// launchNudgeState.test.ts for that), so a fixed, always-pending stub is
+// enough to let init() resolve.
+const STUB_LAUNCH_INFO = {
+  openAtLogin: false,
+  openAtLoginSupported: true,
+  openedAtLogin: false,
+  notificationsSupported: true,
+}
+
 interface Harness {
   push(msg: PushMessage): void
   badges: number[]
@@ -24,6 +35,7 @@ async function harness(): Promise<Harness> {
       setBadge: async (count: number) => {
         badges.push(count)
       },
+      launchInfo: async () => STUB_LAUNCH_INFO,
     },
     settings: { get: async () => null },
     chat: { events: async () => [], cursors: async () => ({}) },
@@ -75,7 +87,7 @@ async function readyHarness(opts: { channels: ChannelView[]; groups?: GroupView[
     onPush: (fn: (msg: PushMessage) => void) => {
       handler = fn
     },
-    app: { getBoot: async () => ({ mode: 'ready' as const, self }), setBadge: async () => {} },
+    app: { getBoot: async () => ({ mode: 'ready' as const, self }), setBadge: async () => {}, launchInfo: async () => STUB_LAUNCH_INFO },
     settings: { get: async () => null },
     chat: {
       channels: async () => opts.channels,
@@ -255,7 +267,7 @@ describe('store: ensureEvents', () => {
       onPush: (fn: (msg: PushMessage) => void) => {
         handler = fn
       },
-      app: { getBoot: async () => ({ mode: 'onboarding' as const }), setBadge: async () => {} },
+      app: { getBoot: async () => ({ mode: 'onboarding' as const }), setBadge: async () => {}, launchInfo: async () => STUB_LAUNCH_INFO },
       settings: { get: async () => null },
       chat: { events: () => events, cursors: async () => ({}) },
     }
@@ -320,5 +332,48 @@ describe('store: health push', () => {
     // A fresh measurement replaces it, including back to zero.
     h.push({ kind: 'health', health: { reachable: true, latencyMs: 8, offsetMs: 0 } } as PushMessage)
     expect(h.store.getState().health.offsetMs).toBe(0)
+  })
+})
+
+// --- onboarding refused: this machine is already somebody's device (1.4.1) ---
+// AppController.onboardSubmit answers 'locked-profile' rather than re-key a
+// profile it cannot open. The renderer's job is to put the person where the
+// two honest choices live — the unlock screen — and say why.
+
+describe('store: locked-profile hand-off', () => {
+  const bridgeApp = () =>
+    (globalThis as unknown as { window: { bridge: { app: Record<string, unknown> } } }).window.bridge.app
+
+  it('lands on the unlock card main names, carrying the sentence', async () => {
+    const h = await harness()
+    bridgeApp().getBoot = async () => ({ mode: 'locked', reason: 'unrecoverable' })
+
+    await h.store.getState().showUnlockScreen('This Mac already holds Chat data.')
+
+    expect(h.store.getState().boot).toEqual({ mode: 'locked', reason: 'unrecoverable' })
+    expect(h.store.getState().unlockNotice).toBe('This Mac already holds Chat data.')
+  })
+
+  it('still leaves onboarding when getBoot cannot be reached', async () => {
+    const h = await harness()
+    bridgeApp().getBoot = async () => {
+      throw new Error('not-ready')
+    }
+
+    await h.store.getState().showUnlockScreen('already holds Chat data')
+
+    // Being refused at all means the profile is sealed and locked; the
+    // passphrase card is the safe card to guess, never onboarding again.
+    expect(h.store.getState().boot).toEqual({ mode: 'locked', reason: 'passphrase' })
+    expect(h.store.getState().unlockNotice).toBe('already holds Chat data')
+  })
+
+  it('drops the notice once the boot mode moves on', async () => {
+    const h = await harness()
+    h.store.setState({ unlockNotice: 'stale' })
+
+    h.push({ kind: 'boot', boot: { mode: 'onboarding' } } as PushMessage)
+
+    expect(h.store.getState().unlockNotice).toBeNull()
   })
 })

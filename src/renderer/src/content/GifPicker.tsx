@@ -1,19 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { SendDraft } from '@shared/bridge'
 import { FilmIcon, SearchIcon } from './icons'
+import { filterPack, packCategories, type GifItem } from './gifFilter'
 import './content.css'
 
 // Spec §4.5 — GIF picker popover. 380×440 frosted surface anchored by the
 // caller. v1 honesty: the bundled pack is empty and search is offline, so the
 // empty state carries the personality — but the plumbing is fully live and
 // renders a 2-col grid the moment either source returns results.
-
-interface GifItem {
-  url: string
-  w: number
-  h: number
-  packId?: string
-}
 
 const CATEGORIES = [
   { emoji: '\u{1F44D}', label: 'Nice' },
@@ -43,11 +37,14 @@ export function GifPicker({
   onClose: () => void
 }) {
   const [query, setQuery] = useState('')
+  const [activeCategory, setActiveCategory] = useState<string | null>(null)
   const [online, setOnline] = useState<boolean | null>(null)
   const [results, setResults] = useState<GifItem[]>([])
   const [pack, setPack] = useState<GifItem[]>([])
   const inputRef = useRef<HTMLInputElement>(null)
   const categories = useMemo(() => shuffled(CATEGORIES), [])
+  const availableCategories = useMemo(() => packCategories(pack), [pack])
+  const visibleCategories = categories.filter((c) => availableCategories.has(c.label.toLowerCase()))
 
   // Load the bundled pack + probe online reachability on open.
   useEffect(() => {
@@ -55,7 +52,8 @@ export function GifPicker({
     void window.bridge.gifs
       .packList()
       .then((items) => {
-        if (alive) setPack(items.map((p) => ({ url: p.url, w: p.w, h: p.h, packId: p.id })))
+        if (alive)
+          setPack(items.map((p) => ({ url: p.url, w: p.w, h: p.h, packId: p.id, category: p.category })))
       })
       .catch(() => {})
     void window.bridge.gifs
@@ -92,9 +90,7 @@ export function GifPicker({
   }, [query])
 
   const q = query.trim().toLowerCase()
-  const packMatches = q
-    ? pack.filter((p) => p.packId?.toLowerCase().includes(q) || p.url.toLowerCase().includes(q))
-    : pack
+  const packMatches = filterPack(pack, query, activeCategory)
   const items: GifItem[] = results.length > 0 ? results : packMatches
 
   const send = (item: GifItem): void => {
@@ -148,7 +144,10 @@ export function GifPicker({
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setActiveCategory(null)
+              setQuery(e.target.value)
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && items.length > 0) send(items[0])
             }}
@@ -214,18 +213,27 @@ export function GifPicker({
           scrollbarWidth: 'none',
         }}
       >
-        {categories.map((c) => (
-          <button
-            key={c.label}
-            className="sem-gif-chip"
-            title={`Search "${c.label}" GIFs`}
-            aria-label={`Search ${c.label} GIFs`}
-            onClick={() => setQuery(c.label)}
-          >
-            <span aria-hidden>{c.emoji}</span>
-            {c.label}
-          </button>
-        ))}
+        {visibleCategories.map((c) => {
+          const pressed = activeCategory === c.label
+          return (
+            <button
+              key={c.label}
+              className="sem-gif-chip"
+              title={pressed ? `Clear the "${c.label}" filter` : `Filter by "${c.label}" GIFs`}
+              aria-label={pressed ? `Clear the ${c.label} filter` : `Filter by ${c.label} GIFs`}
+              aria-pressed={pressed}
+              onClick={() => setActiveCategory((cur) => (cur === c.label ? null : c.label))}
+              style={
+                pressed
+                  ? { background: 'var(--accent-soft)', color: 'var(--accent-text)', borderColor: 'var(--accent)' }
+                  : undefined
+              }
+            >
+              <span aria-hidden>{c.emoji}</span>
+              {c.label}
+            </button>
+          )
+        })}
       </div>
 
       {/* Grid or empty state */}
@@ -274,7 +282,7 @@ export function GifPicker({
               <FilmIcon size={26} />
             </span>
             <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>
-              {q ? 'Nothing in the vault for that' : 'No GIFs here yet'}
+              {q || activeCategory ? 'Nothing in the vault for that' : 'No GIFs here yet'}
             </div>
             <div style={{ fontSize: 12, lineHeight: '17px', color: 'var(--text-3)' }}>
               Try another word, or drag any GIF into the chat.

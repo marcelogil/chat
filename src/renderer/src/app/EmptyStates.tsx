@@ -5,6 +5,15 @@ import { Avatar, DeviceChip, identityHue } from '@/ui/atoms'
 import { modKey } from './chrome'
 import { useDmMap, useGroupMap } from './dm'
 import { IconLock } from './icons'
+import {
+  SAY_HELLO_IDLE,
+  pressSayHello,
+  sayHelloBusy,
+  sayHelloFailed,
+  sayHelloSent,
+  sayHelloToast,
+  sayHelloWasQueued,
+} from './sayHelloState'
 import { toast } from './toasts'
 
 // Spec §10 — delightful empty states. The channel/DM variant floats over the
@@ -76,7 +85,14 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
   const send = useStore((s) => s.send)
   const dmPeers = useDmMap((s) => s.peers)
   const groupMap = useGroupMap()
-  const [sending, setSending] = useState(false)
+  // Keyed by conversation, not just a boolean: this component is never
+  // remounted between conversations (AppShell renders it in one fixed slot with
+  // no `key`), so a bare flag left standing by a successful hello disabled the
+  // button in every empty conversation opened afterwards. It is a set of
+  // conversations, not a single slot, so switching to a second conversation
+  // while the first send is still in flight cannot evict the first one's latch
+  // either. See sayHelloState.ts.
+  const [hello, setHello] = useState(SAY_HELLO_IDLE)
 
   const self = selfOf(boot)
   if (!loaded) return null
@@ -86,15 +102,23 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
   const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
   const hue = channel ? identityHue(channel.name) : 'var(--accent)'
+  const busy = sayHelloBusy(hello, conv)
 
   async function sayHello() {
-    if (sending) return
-    setSending(true)
+    const press = pressSayHello(hello, conv)
+    if (!press.send) return
+    setHello(press.state)
     try {
       await send(conv, { text: 'Hello 👋', kind: 'text' })
+      setHello((s) => sayHelloSent(s, conv))
     } catch (err) {
-      toast(`Could not send — ${err instanceof Error ? err.message : String(err)}`, 'danger')
-      setSending(false)
+      // A queued hello (share unreachable) is a good outcome, not a failure —
+      // the latch stays up so a second press before the outbox flushes cannot
+      // queue a second "Hello 👋". Anything else really did fail, so the
+      // button comes back and the rail says what main said.
+      setHello((s) => (sayHelloWasQueued(err) ? sayHelloSent(s, conv) : sayHelloFailed(s, conv)))
+      const t = sayHelloToast(err)
+      toast(t.text, t.tone)
     }
   }
 
@@ -202,9 +226,10 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
             <button
               className="sem-chip-btn"
               onClick={() => void sayHello()}
-              disabled={sending}
+              disabled={busy}
+              aria-label="Say hello"
               title="Send a hello to get things going"
-              style={{ pointerEvents: 'auto', opacity: sending ? 0.6 : 1 }}
+              style={{ pointerEvents: 'auto', opacity: busy ? 0.6 : 1 }}
             >
               Say hello 👋
             </button>

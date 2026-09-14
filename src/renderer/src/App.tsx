@@ -11,6 +11,7 @@ import AppShell from './app/AppShell'
 
 export default function App() {
   const boot = useStore((s) => s.boot)
+  const unlockNotice = useStore((s) => s.unlockNotice)
   const init = useStore((s) => s.init)
 
   useEffect(() => {
@@ -24,7 +25,7 @@ export default function App() {
       </div>
     )
   }
-  if (boot.mode === 'locked') return <UnlockScreen reason={boot.reason} />
+  if (boot.mode === 'locked') return <UnlockScreen reason={boot.reason} notice={unlockNotice} />
   if (boot.mode === 'onboarding')
     return <Onboarding suggestion={boot.sharePathSuggestion} savedName={boot.savedName ?? null} />
   return <AppShell />

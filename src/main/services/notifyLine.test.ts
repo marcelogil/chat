@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { notifyLineFor } from './notifyLine'
+import { notifyLineFor, prTransitionLine } from './notifyLine'
 
 // The whole wording matrix an OS notification can produce: three conversation
 // kinds times previews on/off. A private group notifies like a DM (you were
@@ -47,5 +47,52 @@ describe('notifyLineFor', () => {
     // A private group is not a direct message and does not claim to be one.
     expect(notifyLineFor({ kind: 'grp', who: 'Alice', previews: false, snippet: 'x' }).body).toBe('New message')
     expect(notifyLineFor({ kind: 'chan', who: 'Alice', previews: false, snippet: 'x' }).body).toBe('New message')
+  })
+})
+
+// The author side (1.4): what my own pull request says when it moves. The body
+// is always "<title> · <repo>", so the assertions below are about the title.
+describe('prTransitionLine', () => {
+  const pr = { id: 123, title: 'Clamp the refund window', repoName: 'api' }
+
+  it('names the reviewer who requested changes', () => {
+    expect(prTransitionLine({ ...pr, kind: 'changes-requested', by: ['Ana'], openThreads: 0 })).toEqual({
+      title: 'Your PR #123 — changes requested by Ana',
+      body: 'Clamp the refund window · api',
+    })
+  })
+
+  it('joins two names, and counts the rest instead of listing them', () => {
+    expect(prTransitionLine({ ...pr, kind: 'changes-requested', by: ['Ana', 'Bob'], openThreads: 0 }).title).toBe(
+      'Your PR #123 — changes requested by Ana and Bob',
+    )
+    expect(
+      prTransitionLine({ ...pr, kind: 'changes-requested', by: ['Ana', 'Bob', 'Cai'], openThreads: 0 }).title,
+    ).toBe('Your PR #123 — changes requested by Ana and 2 others')
+  })
+
+  it('still reads as a sentence when nobody can be named', () => {
+    expect(prTransitionLine({ ...pr, kind: 'changes-requested', by: ['', '  '], openThreads: 0 }).title).toBe(
+      'Your PR #123 — changes requested',
+    )
+  })
+
+  it('counts open comments, singular and plural', () => {
+    expect(prTransitionLine({ ...pr, kind: 'comments-open', by: [], openThreads: 1 }).title).toBe(
+      'Your PR #123 has 1 open comment',
+    )
+    expect(prTransitionLine({ ...pr, kind: 'comments-open', by: [], openThreads: 2 }).title).toBe(
+      'Your PR #123 has 2 open comments',
+    )
+    // A server too old to serve threads reports zero; the news is still true.
+    expect(prTransitionLine({ ...pr, kind: 'comments-open', by: [], openThreads: 0 }).title).toBe(
+      'Your PR #123 has 1 open comment',
+    )
+  })
+
+  it('says what to do next when it is approved', () => {
+    expect(prTransitionLine({ ...pr, kind: 'approved', by: [], openThreads: 0 }).title).toBe(
+      'Your PR #123 is approved — ready to complete',
+    )
   })
 })

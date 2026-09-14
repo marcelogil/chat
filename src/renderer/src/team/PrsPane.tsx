@@ -3,9 +3,13 @@ import type { AdoError, AdoErrorCode, PrView } from '@shared/types'
 import { useStore } from '@/store'
 import { Avatar, Button, IconButton, Spinner } from '@/ui/atoms'
 import { IconExternal, IconGear, IconGitPull, IconRefresh, IconWarn } from '@/app/icons'
+import { NotificationsBell, NotificationsPopover } from '@/app/NotificationsPopover'
 import { truncate } from '@/app/chrome'
 import { toast } from '@/app/toasts'
 import { PrsPrefs } from './PrsPrefs'
+import { DEFAULT_THRESHOLDS, groupPrs, nextLine, waitLabel } from './prsGroups'
+import type { PrsThresholds } from './prsGroups'
+import { PrStateChip, prStateTooltip } from './PrStateChip'
 
 // Spec §2.7 — the pull-request pane. Owns the whole centre column (no channel
 // header, no right rail). Everything it shows comes from the main-side PR
@@ -31,9 +35,9 @@ export function timeAgo(ms: number, now = Date.now()): string {
 }
 
 /** "3d ago" / "just now" / "unknown" — never "56y ago" for a missing date. */
-function agoPhrase(ms: number): string {
+export function agoPhrase(ms: number, now = Date.now()): string {
   if (!Number.isFinite(ms) || ms <= 0) return 'unknown'
-  const t = timeAgo(ms)
+  const t = timeAgo(ms, now)
   return t === 'just now' ? t : `${t} ago`
 }
 
@@ -191,13 +195,35 @@ function shortName(name: string): string {
   return first.length > 14 ? `${first.slice(0, 13)}…` : first
 }
 
-function PrRow({ pr, asName }: { pr: PrView; asName: string | null }) {
+function PrRow({
+  pr,
+  asName,
+  now,
+  thresholds,
+}: {
+  pr: PrView
+  asName: string | null
+  now: number
+  thresholds: PrsThresholds
+}) {
   const [hover, setHover] = useState(false)
   const open = () => {
     void window.bridge.app.openExternal(pr.webUrl).catch(() => toast('Could not open the browser', 'danger'))
   }
   const shown = pr.reviewers.slice(0, 4)
   const extra = pr.reviewers.length - shown.length
+  // Once main attaches `state`, it replaces both the plain "created X ago"
+  // tail and the vote-based AwaitingChip — the chip + the attention group
+  // already cover "you're the one blocking this."
+  const tail = pr.state ? nextLine(pr.state) : ''
+  const stateTooltip = pr.state ? prStateTooltip(pr.state, pr.createdAt, now) : null
+  // Everything the row says visually, in the order it says it: the chip (which
+  // carries the wait), the "Next: …" line, then the chip's own tooltip. A
+  // screen reader that only ever hears the label would otherwise miss the two
+  // facts the 1.4 pane exists for — how long, and who now.
+  const stateLabel = pr.state
+    ? [waitLabel(pr.state, now), tail, stateTooltip].filter((part) => part !== '' && part !== null).join(', ')
+    : ''
 
   return (
     <div
@@ -220,7 +246,7 @@ function PrRow({ pr, asName }: { pr: PrView; asName: string | null }) {
       title={`${pr.title} — open #${pr.id} in the browser`}
       aria-label={`Pull request ${pr.id}, ${pr.title}, in ${pr.repoName} by ${pr.author.name}${
         pr.seen ? '' : ', unseen'
-      }`}
+      }${stateLabel ? `, ${stateLabel}` : ''}`}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -261,11 +287,15 @@ function PrRow({ pr, asName }: { pr: PrView; asName: string | null }) {
           >
             {pr.title}
           </span>
-          {pr.assignedToMe && pr.myVote === 0 && <AwaitingChip asName={asName} />}
+          {pr.state ? (
+            <PrStateChip state={pr.state} createdAt={pr.createdAt} thresholds={thresholds} now={now} />
+          ) : (
+            pr.assignedToMe && pr.myVote === 0 && <AwaitingChip asName={asName} />
+          )}
         </div>
         <div style={{ ...truncate, marginTop: 3, fontSize: 11, color: 'var(--text-3)' }}>
-          {pr.repoName} · {pr.author.name || 'unknown author'} · {pr.sourceBranch} → {pr.targetBranch} · created{' '}
-          {agoPhrase(pr.createdAt)}
+          {pr.repoName} · {pr.author.name || 'unknown author'} · {pr.sourceBranch} → {pr.targetBranch} ·{' '}
+          {tail || `created ${agoPhrase(pr.createdAt)}`}
         </div>
       </div>
 
@@ -459,6 +489,27 @@ function TokenCard({ baseUrl }: { baseUrl: string }) {
   )
 }
 
+/** A group section header (spec §2 U a11y: a real heading, not just styled text). */
+function GroupHeader({ label, count }: { label: string; count: number }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, padding: '4px 2px 0' }}>
+      <h3
+        style={{
+          margin: 0,
+          fontSize: 11,
+          fontWeight: 600,
+          letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+          color: 'var(--text-3)',
+        }}
+      >
+        {label}
+      </h3>
+      <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{count}</span>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // The pane
 
@@ -474,6 +525,8 @@ export function PrsPane() {
   const [repoId, setRepoId] = useState('')
   const [query, setQuery] = useState('')
   const [refreshing, setRefreshing] = useState(false)
+  /** 1.4 — the notification controls popover, anchored to the header bell. */
+  const [notifyOpen, setNotifyOpen] = useState(false)
 
   const meId = status?.me?.id ?? null
   const repos = useMemo(() => status?.repos ?? [], [status])
@@ -574,6 +627,25 @@ export function PrsPane() {
   const repoLabel = repos.length === 1 ? repos[0].name : `${repos.length} repositories`
   const subtitle = !status ? '' : !configured ? 'Not connected yet' : `${repoLabel} · ${status.project || 'project'}`
 
+  // `status` carries the team's live thresholds (defaulted from `PRS`
+  // main-side when the config predates them); fall back to the same
+  // defaults here only for the brief window before the first status loads.
+  // `now` is one snapshot for the whole grouped render pass: bucketing,
+  // every row's chip, and the stale header's day count.
+  const thresholds: PrsThresholds = status
+    ? { reviewSlaHours: status.reviewSlaHours, staleAfterDays: status.staleAfterDays }
+    : DEFAULT_THRESHOLDS
+  const now = Date.now()
+  const groups = groupPrs(filtered, meId, now)
+  // Counted from `filtered`, not from `PrsStatus` — the chip sits next to the
+  // "N shown of M tracked" count and above a filtered list, so a team-wide
+  // number there reads as a claim about what you are looking at. The title
+  // says which list it counted, and `PrsStatus.overdue/stale` stay the
+  // team-wide numbers the sidebar subtitle uses.
+  const overdue = filtered.reduce((n, p) => n + (p.state?.overdue ? 1 : 0), 0)
+  const stale = filtered.reduce((n, p) => n + (p.state?.stale ? 1 : 0), 0)
+  const shownOf = filtered.length === prs.length ? 'tracked' : 'shown'
+
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-app)' }}>
       <div
@@ -614,6 +686,36 @@ export function PrsPane() {
             }}
           >
             {filtered.length}
+          </span>
+        )}
+        {configured && (overdue > 0 || stale > 0) && (
+          <span
+            title={
+              // "overdue" is a review SLA and nothing else: a wait on the
+              // author can colour a row's chip red without ever being counted
+              // here (see prsGroups.waitTone).
+              `Of the ${filtered.length} pull request${filtered.length === 1 ? '' : 's'} ${shownOf}: ` +
+              `${overdue} waiting on reviewers past the ${thresholds.reviewSlaHours}h review SLA · ` +
+              `${stale} with no activity for ${thresholds.staleAfterDays}+ days`
+            }
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              height: 18,
+              padding: '0 7px',
+              borderRadius: 'var(--r-full)',
+              background: 'var(--bg-raised)',
+              border: '1px solid var(--border-subtle)',
+              fontSize: 11,
+              fontWeight: 600,
+              whiteSpace: 'nowrap',
+              flexShrink: 0,
+            }}
+          >
+            {overdue > 0 && <span style={{ color: 'var(--warning)' }}>{overdue} overdue</span>}
+            {overdue > 0 && stale > 0 && <span style={{ color: 'var(--text-3)' }}>·</span>}
+            {stale > 0 && <span style={{ color: 'var(--danger)' }}>{stale} stale</span>}
           </span>
         )}
         <span
@@ -659,6 +761,12 @@ export function PrsPane() {
             <IconRefresh size={16} />
           </span>
         </IconButton>
+        {/* 1.4 — the same quick controls as the sidebar bell, where the pull
+            requests are: "only mine" and "pause" are asked for right here. */}
+        <span style={{ position: 'relative', display: 'flex', flexShrink: 0 }}>
+          <NotificationsBell open={notifyOpen} onToggle={() => setNotifyOpen((v) => !v)} />
+          {notifyOpen && <NotificationsPopover placement="header" onClose={() => setNotifyOpen(false)} />}
+        </span>
         <IconButton label="Pull request settings" active={prefsOpen} onClick={() => setPrefsOpen(true)}>
           <IconGear size={16} />
         </IconButton>
@@ -758,14 +866,24 @@ export function PrsPane() {
             </div>
             <div style={{ fontSize: 13 }}>
               {prs.length === 0
-                ? 'Approved, completed and draft pull requests drop off this list automatically.'
+                ? 'Completed and draft pull requests drop off this list automatically; approved ones wait under Ready to complete.'
                 : `${prs.length} pull request${prs.length === 1 ? ' is' : 's are'} hidden by the filters above.`}
             </div>
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 16px 16px' }}>
-            {filtered.map((p) => (
-              <PrRow key={p.key} pr={p} asName={sharedAs} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: '10px 16px 16px' }}>
+            {groups.map((g) => (
+              <div key={g.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {g.key !== 'legacy' && <GroupHeader label={g.label} count={g.prs.length} />}
+                {g.key === 'stale' && (
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', padding: '0 2px 2px' }}>
+                    No activity for {thresholds.staleAfterDays}+ days. Abandon or revive?
+                  </div>
+                )}
+                {g.prs.map((p) => (
+                  <PrRow key={p.key} pr={p} asName={sharedAs} now={now} thresholds={thresholds} />
+                ))}
+              </div>
             ))}
           </div>
         )}

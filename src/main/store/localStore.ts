@@ -79,6 +79,17 @@ export class LocalStore implements SecretStore {
     return this.lmk !== null
   }
 
+  /**
+   * True when a sealed LMK is already on disk — i.e. this profile belongs to a
+   * device that has been set up, whether or not this process can open it. The
+   * identity, the DM keys and every cached secret hang off that one file, so
+   * "is there a seal here?" is the question every destructive path has to ask
+   * before it writes a new one.
+   */
+  hasSealedData(): boolean {
+    return existsSync(this.sealedPath)
+  }
+
   private get sealedPath(): string {
     return join(this.dir, LMK_SEALED)
   }
@@ -154,6 +165,16 @@ export class LocalStore implements SecretStore {
 
   /** First run without an OS keystore: fresh random LMK wrapped under the passphrase. */
   createPassphraseLmk(passphrase: string): void {
+    // The floor under every caller, and the last line of defence for someone's
+    // device identity: a new LMK over an existing seal makes identity.enc,
+    // pins.enc and every cache permanently unreadable. It is *destroying* local
+    // data, not creating it, and the one path allowed to do that is the
+    // explicit, user-confirmed reset — which calls wipe() first, so no seal is
+    // here by the time it gets back to this method. (2026-09-14: onboarding
+    // called this against a locked profile and destroyed a real identity.)
+    if (this.hasSealedData()) {
+      throw new Error('LocalStore already holds sealed data — wipe() is the only way to replace it')
+    }
     // Any *.enc left over (an aborted setup, a wiped-by-hand seal) can't be
     // read under a new LMK and would only ever throw. Start clean.
     this.clearSecrets()

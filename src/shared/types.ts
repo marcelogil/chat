@@ -343,6 +343,10 @@ export interface PrsConfig {
   project: string // project name (or id)
   repos: PrsRepo[] // watched repositories; empty = nothing tracked
   sharedToken: string // '' when the configurer chose not to share
+  /** 1.4 — a review is overdue after this many hours (default PRS.reviewSlaHours). */
+  reviewSlaHours?: number
+  /** 1.4 — a PR is stale after this many days without activity (default PRS.staleAfterDays). */
+  staleAfterDays?: number
 }
 
 /** Full snapshot of the group config; LWW by event stem. */
@@ -575,6 +579,41 @@ export interface AdoError {
 
 export type AdoResult<T> = { ok: true; value: T } | { ok: false; error: AdoError }
 
+/** Who should act on a pull request right now (1.4). */
+export type PrNextActor = 'reviewers' | 'author' | 'nobody'
+
+/**
+ * The wait a pull request is in (1.4), computed locally from the PR list plus
+ * its threads and iterations. Drafts are excluded before this is computed.
+ */
+export type PrStateKind =
+  | 'needs-review' // nobody blocking, no open threads, a reviewer still to vote since the last push → reviewers
+  | 'changes-requested' // a −5/−10 vote after the last push → author
+  | 'comments-open' // unresolved threads whose last comment is not the author's → author
+  | 'author-replied' // every open thread's last comment is the author's → the reviewers who opened them
+  | 'approved' // all required reviewers approved, no open threads → author, to complete
+
+export interface PrState {
+  kind: PrStateKind
+  next: PrNextActor
+  /** ADO identity ids / display names of who should act now. */
+  nextIds: string[]
+  nextNames: string[]
+  /** ms epoch when the current wait began. */
+  since: number
+  /** ms epoch of the last activity of any kind: creation, push, comment, or an observed vote. */
+  lastActivityAt: number
+  lastPushAt: number | null
+  /** Unresolved (active/pending) threads. */
+  openThreads: number
+  /** False when the server cannot serve threads (API < 3.0) or they were not fetched yet. */
+  threadsKnown: boolean
+  /** No activity for `staleAfterDays`. */
+  stale: boolean
+  /** Waiting on reviewers longer than `reviewSlaHours`. */
+  overdue: boolean
+}
+
 export interface PrView {
   key: string // `${repoId}:${pullRequestId}`
   id: number
@@ -591,6 +630,10 @@ export interface PrView {
   myVote: number // 0 when not a reviewer
   webUrl: string
   seen: boolean
+  /** 1.4 — always set by the service; optional only so the contract typechecks ahead of it. */
+  state?: PrState
+  /** `lastMergeSourceCommit.commitId` — a cheap "the author pushed" signal (1.4). */
+  lastMergeCommit?: string
 }
 
 export interface PrsStatus {
@@ -605,7 +648,18 @@ export interface PrsStatus {
   lastPollAt: number | null
   polling: boolean
   error: AdoError | null
+  /** PRs still waiting for someone. An `approved` PR is listed but never counted here (1.4). */
   unseen: number
+  /** 1.4 — PRs waiting on reviewers past the team's SLA, and PRs with no activity past the stale threshold. */
+  overdue: number
+  stale: number
+  /**
+   * 1.4 — the team's live thresholds, defaulted from `PRS` when the config
+   * predates them. The prefs pane prefills from these, and the pane's stale
+   * line quotes them ("No activity for 14+ days").
+   */
+  reviewSlaHours: number
+  staleAfterDays: number
 }
 
 export type PrsProbe =
@@ -630,4 +684,12 @@ export interface PresenceView {
    * resolve and pending DM traffic stays reachable; roster surfaces hide it.
    */
   departed: boolean
+  /**
+   * 1.4 — the device id that replaced this one: the same person, on the same
+   * machine, set up again after "Reset local data" (`transport/supersede.ts`).
+   * Always implies `departed`; the extra field is what lets a surface say
+   * *why* — a DM with history is labelled "(previous device)" rather than
+   * quietly disappearing like a teammate who has merely been quiet for days.
+   */
+  supersededBy?: string
 }

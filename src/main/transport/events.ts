@@ -1,6 +1,6 @@
 import { DST, EVENT } from '@shared/constants'
 import { hlcObserve, hlcTick } from '@shared/hlc'
-import { dayShard, eventFileName, isGrpConv, parseEventFileName } from '@shared/ids'
+import { dayShard, eventFileName, isChanConv, isGrpConv, parseEventFileName } from '@shared/ids'
 import type { ConvId, EventPayload, EventType, SignedRecord, VerifiedEvent } from '@shared/types'
 import { buildAad, decryptRecord, encryptRecord, recordKid } from '../crypto/envelope'
 import { signRecord, verifyRecord } from '../crypto/identity'
@@ -34,6 +34,13 @@ interface ConvLog {
 export type EventListener = (conv: ConvId, event: VerifiedEvent) => void
 
 /**
+ * Fired when `publish()` loads a channel this session didn't know about yet
+ * (see the comment there) — the sidebar has the conv id already but not its
+ * name until the channels push this drives goes out.
+ */
+export type ChannelDiscoveredListener = () => void
+
+/**
  * Ceiling on files parked for one conversation while their key is in flight.
  * Generous next to a real rotation (a rekey DM is on the share before the first
  * record under the new key is), and small enough that a peer inventing epochs
@@ -44,6 +51,7 @@ const MAX_PARKED_PER_CONV = 500
 export class EventStore {
   private logs = new Map<ConvId, ConvLog>()
   private listeners: EventListener[] = []
+  private channelDiscoveredListeners: ChannelDiscoveredListener[] = []
   /** Sticky skew flags per device (UI banner). */
   readonly skewFlagged = new Set<string>()
 
@@ -51,6 +59,10 @@ export class EventStore {
 
   onEvent(cb: EventListener): void {
     this.listeners.push(cb)
+  }
+
+  onChannelDiscovered(cb: ChannelDiscoveredListener): void {
+    this.channelDiscoveredListeners.push(cb)
   }
 
   private log(conv: ConvId): ConvLog {
@@ -95,7 +107,27 @@ export class EventStore {
 
   async publish(conv: ConvId, type: EventType, payload: EventPayload): Promise<VerifiedEvent> {
     const s = this.session
-    const info = s.convInfo(conv)
+    let info = s.convInfo(conv)
+    // A channel can reach the UI before this session has read its metadata —
+    // the sidebar hears about one as soon as a beacon head or a sys event
+    // names it, while `loadChannels()` only runs on the poller's 1–10 minute
+    // sweep. Writing into that window used to be rejected outright ("Say hello
+    // does nothing"), so the conv id buys one targeted read of its
+    // `channel.json.e1` first (the token is derivable from the id — no
+    // directory listing), then the log, so a tombstone or a rename that is
+    // already on the share folds before we decide. Only channels: a DM token
+    // cannot be reversed to a peer, and a group's key only ever arrives in an
+    // invite — for both, not knowing it really is the answer.
+    if (!info && isChanConv(conv)) {
+      if (await s.ensureChannel(conv)) {
+        await this.catchUp(conv)
+        info = s.convInfo(conv)
+        // The sidebar already has this conv id (that's how we got handed it);
+        // without this it would still show up nameless until some unrelated
+        // sweep or beacon head happened to push `channels` again.
+        for (const cb of this.channelDiscoveredListeners) cb()
+      }
+    }
     if (!info) throw new Error(`unknown conversation ${conv}`)
     const { ms, ctr } = hlcTick(s.hlc, s.io.calibratedNow())
     const fileName = eventFileName(ms, ctr, s.deviceId, type)

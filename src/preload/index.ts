@@ -32,6 +32,9 @@ const bridge: BridgeApi = {
     openAppsFolder: () => invoke('app:openAppsFolder'),
     setFullScreen: (on) => invoke('app:setFullScreen', on),
     isFullScreen: () => invoke('app:isFullScreen'),
+    launchInfo: () => invoke('app:launchInfo'),
+    setOpenAtLogin: (on) => invoke('app:setOpenAtLogin', on),
+    testNotification: () => invoke('app:testNotification'),
   },
 
   onboarding: {
@@ -81,6 +84,7 @@ const bridge: BridgeApi = {
 
   presence: {
     list: () => invoke('presence:list'),
+    self: () => invoke('presence:self'),
     setStatus: (text) => invoke('presence:setStatus', text),
     setAppearState: (state) => invoke('presence:setAppearState', state),
   },

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { Attachment, MsgPayload } from '@shared/types'
 import { useStore } from '@/store'
+import { DRAG, NO_DRAG, overlayChromeInsets } from '@/app/chrome'
 import { formatBytes } from '@/ui/atoms'
 import { middleTruncate } from './parse'
 import { useBlobMedia } from './useBlobMedia'
@@ -41,6 +42,10 @@ function findAttachment(
 export function Lightbox() {
   const lightbox = useStore((s) => s.lightbox)
   const events = useStore((s) => (lightbox ? s.events[lightbox.conv] : undefined))
+  // Where the OS window buttons are, in this overlay's coordinates. Fullscreen
+  // hides them, so the strip goes back to its natural padding there.
+  const fullscreen = useStore((s) => s.fullscreen)
+  const chromeInsets = overlayChromeInsets(window.bridge.platform, fullscreen)
   const [note, setNote] = useState<string | null>(null)
   const noteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -101,10 +106,15 @@ export function Lightbox() {
         justifyContent: 'center',
       }}
     >
-      {/* Top chrome */}
+      {/* Top chrome. Same rule as the diagram editor's header (1.4): this strip
+          sits over the shell's drag region, which Chromium computes from the
+          DOM and not from z-order — so it takes the region over (the window can
+          still be moved by it) and every control in it opts out with NO_DRAG,
+          while the content is inset past the OS's own window buttons. */}
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
+          ...DRAG,
           position: 'absolute',
           top: 0,
           left: 0,
@@ -113,11 +123,12 @@ export function Lightbox() {
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          padding: '0 12px 0 16px',
+          paddingLeft: 16 + chromeInsets.left,
+          paddingRight: 12 + chromeInsets.right,
           userSelect: 'none',
         }}
       >
-        <span style={{ minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span style={{ ...NO_DRAG, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 8 }}>
           <span style={{ fontSize: 13, fontWeight: 500, color: '#fff', whiteSpace: 'nowrap' }}>
             {middleTruncate(att.name, 48)}
           </span>
@@ -127,13 +138,14 @@ export function Lightbox() {
         </span>
         <span style={{ flex: 1 }} />
         {note && (
-          <span style={{ fontSize: 12, color: 'var(--warning)', whiteSpace: 'nowrap' }}>{note}</span>
+          <span style={{ ...NO_DRAG, fontSize: 12, color: 'var(--warning)', whiteSpace: 'nowrap' }}>{note}</span>
         )}
         <button
           onClick={saveAs}
           title={`Save ${att.name} as…`}
           aria-label={`Save ${att.name} as…`}
           style={{
+            ...NO_DRAG,
             display: 'inline-flex',
             alignItems: 'center',
             gap: 5,
@@ -157,6 +169,7 @@ export function Lightbox() {
           title="Close (Esc)"
           aria-label="Close media viewer"
           style={{
+            ...NO_DRAG,
             width: 28,
             height: 28,
             display: 'inline-flex',

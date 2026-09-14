@@ -288,6 +288,19 @@ export const POLL_LIMITS = {
   maxOptionChars: 100,
 } as const
 
+/** Pull-request waiting states (1.4). */
+export const PRS = {
+  reviewSlaHours: 48,
+  staleAfterDays: 14,
+  /** Threads + iterations of a tracked PR are re-read this often when nothing else triggers it. */
+  detailRefreshMs: 5 * 60_000,
+  /** Threads and iterations exist from this Azure DevOps REST version (TFS 2017). */
+  minApiForThreads: '3.0',
+  /** Bounds for the shared thresholds. */
+  reviewSlaHoursRange: [1, 720] as readonly [number, number],
+  staleAfterDaysRange: [1, 365] as readonly [number, number],
+} as const
+
 export const DIAGRAM = {
   /** Compressed scene bytes above this go to the blob store instead of inline. */
   maxInlineBytes: 120 * 1024,

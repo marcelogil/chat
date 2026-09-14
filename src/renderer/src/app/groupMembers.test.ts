@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ConvId, PresenceView } from '@shared/types'
-import { groupMemberRows, pickAddCandidates } from './groupMembers'
+import { groupMemberRows, memberRowSuffix, pickAddCandidates } from './groupMembers'
 
 function person(over: Partial<PresenceView> & { deviceId: string; name: string }): PresenceView {
   return {
@@ -41,6 +41,39 @@ describe('pickAddCandidates', () => {
 
   it('returns nothing when the query matches nobody', () => {
     expect(pickAddCandidates(presence, 'me000001', [], 'nope')).toEqual([])
+  })
+
+  it('offers one row for a person whose re-join main cannot yet tell apart', () => {
+    // Killed without a goodbye beacon, so neither registration is `departed`
+    // for another ≤50 s (twinDevices.ts). Adding the dead one to a group
+    // would hand the key to a device that can never read it.
+    const twins = [
+      person({ deviceId: 'gil00old', name: 'Gil', hostname: 'gils-mac', lastSeenMs: 1_000 }),
+      person({ deviceId: 'gil00new', name: 'Gil', hostname: 'gils-mac', lastSeenMs: 9_000 }),
+    ]
+    expect(pickAddCandidates(twins, 'me000001', []).map((p) => p.deviceId)).toEqual(['gil00new'])
+  })
+})
+
+describe('memberRowSuffix', () => {
+  const ghost = person({ deviceId: 'gil00old', name: 'Gil', departed: true, supersededBy: 'gil00new' })
+
+  it('names the previous device, so the dialog never shows one person twice under one name', () => {
+    expect(memberRowSuffix(ghost)).toBe(' (previous device)')
+  })
+
+  it('keeps owner and you where they were', () => {
+    expect(memberRowSuffix(person({ deviceId: 'a', name: 'Ana' }), { owner: true })).toBe(' · owner')
+    expect(memberRowSuffix(undefined, { self: true })).toBe(' (you)')
+    expect(memberRowSuffix(person({ deviceId: 'a', name: 'Ana' }), {})).toBe('')
+  })
+
+  it('reads the previous device first — it is part of who the row is, not a role', () => {
+    expect(memberRowSuffix(ghost, { owner: true })).toBe(' (previous device) · owner')
+  })
+
+  it('says nothing for a member presence has never seen', () => {
+    expect(memberRowSuffix(undefined)).toBe('')
   })
 })
 

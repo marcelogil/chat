@@ -1,9 +1,10 @@
 import { app, BrowserWindow, dialog, powerMonitor, protocol, shell } from 'electron'
 import { basename, dirname, join } from 'node:path'
-import { existsSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
 import type { PushMessage } from '@shared/bridge'
 import { AppController } from './appController'
 import { registerIpc } from './ipc'
+import { USER_DATA_ENV, resolveUserDataDir, type UserDataResolution } from './userData'
 import { lockNavigation } from './navGuard'
 import { IoTierManager } from './services/ioTier'
 import { blobSchemePrivileges, registerBlobProtocol } from './services/blobProtocol'
@@ -15,24 +16,51 @@ import { gifSchemePrivileges, registerGifProtocol } from './services/gifProtocol
 // repeated appendSwitch('disable-features', ...) calls overwrite each other.
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns')
 
-// Dev convenience: SEMAPHORE_PROFILE=alice|bob gives each instance its own
-// userData so two clients can run side-by-side against one local "share".
-const profile = process.env.SEMAPHORE_PROFILE
-if (profile && !app.isPackaged) {
-  app.setPath('userData', `${app.getPath('userData')}-${profile}`)
+// Which profile this process runs against, before *anything* reads userData —
+// the controller's LocalStore is built from it, and Chromium takes it as the
+// single-instance lock's home. CHAT_USER_DATA_DIR is honoured in every build
+// (a packaged verification run must be able to stay off a real profile);
+// SEMAPHORE_PROFILE stays the dev-only two-instance convenience it was.
+// Decision table + why: src/main/userData.ts and CLAUDE.md, "Profiles and test runs".
+const userData: UserDataResolution = resolveUserDataDir({
+  defaultDir: app.getPath('userData'),
+  env: process.env,
+  isPackaged: app.isPackaged,
+})
+if (userData.rejected) {
+  // Falling back to the default profile is exactly the accident this guards
+  // against — whoever set the variable did not want it. Refuse to start.
+  console.error(`[chat] ${userData.rejected}`)
+  app.exit(1)
+} else {
+  if (userData.source !== 'default') {
+    try {
+      mkdirSync(userData.dir, { recursive: true })
+      app.setPath('userData', userData.dir)
+    } catch (err) {
+      console.error(`[chat] could not create ${USER_DATA_ENV}=${userData.dir}: ${err instanceof Error ? err.message : String(err)}`)
+      app.exit(1)
+    }
+  }
+  if (userData.source === 'override') {
+    console.log(`[chat] ${USER_DATA_ENV} is set — using profile ${userData.dir} (not the default one)`)
+  }
 }
+const profile = process.env.SEMAPHORE_PROFILE
 
 // The app used to be called Semaphore, and userData is named after the app.
 // A profile from those builds holds this device's identity (and its DM key),
 // so carry it over rather than greet the user as a brand-new device. Rename
 // is atomic within the volume; if it can't happen, keep using the old folder.
-{
-  const userData = app.getPath('userData')
-  const legacy = join(dirname(userData), basename(userData).replace(/^Chat/, 'Semaphore'))
-  if (legacy !== userData && !existsSync(join(userData, 'lmk.sealed')) && existsSync(join(legacy, 'lmk.sealed'))) {
+// Skipped under an explicit override: a scratch profile must be exactly the
+// directory that was asked for, never an inherited (or deleted) real one.
+if (userData.source !== 'override') {
+  const dir = app.getPath('userData')
+  const legacy = join(dirname(dir), basename(dir).replace(/^Chat/, 'Semaphore'))
+  if (legacy !== dir && !existsSync(join(dir, 'lmk.sealed')) && existsSync(join(legacy, 'lmk.sealed'))) {
     try {
-      rmSync(userData, { recursive: true, force: true }) // at most a Chromium cache from a launch that never set up
-      renameSync(legacy, userData)
+      rmSync(dir, { recursive: true, force: true }) // at most a Chromium cache from a launch that never set up
+      renameSync(legacy, dir)
     } catch {
       app.setPath('userData', legacy)
     }

@@ -412,6 +412,110 @@ describe('two-client integration over a shared folder', () => {
     expect(alice.session.channelsByToken.has('STRAYTOKEN000000000A')).toBe(false)
   })
 
+  it('sends into a channel this client knows the id of but has not loaded yet', async () => {
+    // The window the "Say hello does nothing" report lives in: Alice makes a
+    // channel, Bob's client is handed the conv id (a beacon head, a sys event,
+    // the channels push behind the sidebar row) and somebody writes into it
+    // before Bob's next blanket sweep has read `channel.json.e1`. That used to
+    // be rejected outright with "unknown conversation" — the send failed while
+    // the row sat in the sidebar looking perfectly ordinary.
+    const ch = await alice.session.createChannel('discovered-late')
+    const conv: ConvId = `chan:${ch.channelId}`
+    expect(bob.session.channels.has(ch.channelId)).toBe(false)
+    expect(bob.session.convInfo(conv)).toBeNull()
+
+    const stem = await sendMessage(bob, conv, 'Hello 👋')
+
+    // The conv id carried its own token, so one metadata read was enough.
+    expect(bob.session.channels.get(ch.channelId)?.name).toBe('discovered-late')
+    expect(bob.events.has(conv, stem)).toBe(true)
+    await alice.events.catchUp(conv)
+    expect(textsIn(alice, conv)).toEqual(['Hello 👋'])
+
+    // Only channels: a DM token we hold no key for, a private group we were
+    // never invited to, and a channel id nobody ever created are all still
+    // refused — there is nothing on the share to load for any of them.
+    await expect(sendMessage(bob, 'chan:deadbeef' as ConvId, 'nope')).rejects.toThrow(/unknown conversation/)
+    await expect(sendMessage(bob, 'dm:ZZZZZZZZZZZZZZZZZZZZ' as ConvId, 'nope')).rejects.toThrow(/unknown conversation/)
+    await expect(sendMessage(bob, 'grp:00000000000000000000' as ConvId, 'nope')).rejects.toThrow(/unknown conversation/)
+  }, 60_000)
+
+  it('tells its listener when a send has to load the channel first, and only then', async () => {
+    // The other half of the on-demand-load fix: the head-discovery path above
+    // already had its own onNewDevice nudge (via the poller), but publish()'s
+    // own on-demand load — the exact path the previous test exercises — used
+    // to complete in silence. ChatService wires this straight to pushChannels
+    // so the sidebar gets the name without waiting on an unrelated push.
+    let discovered = 0
+    bob.events.onChannelDiscovered(() => discovered++)
+
+    const ch = await alice.session.createChannel('discovered-by-publish')
+    const conv: ConvId = `chan:${ch.channelId}`
+    expect(bob.session.channels.has(ch.channelId)).toBe(false)
+
+    await sendMessage(bob, conv, 'first one in')
+    expect(discovered).toBe(1)
+
+    // Already known the second time around: no second nudge for the same channel.
+    await sendMessage(bob, conv, 'second one in')
+    expect(discovered).toBe(1)
+  }, 60_000)
+
+  it("discovers a channel from a peer's beacon head and tells the shell at once", async () => {
+    // The other half of the same window: discovery used to happen only inside
+    // the blanket sweep's `loadChannels()`, and the sweep decides "anything
+    // new?" by comparing `channels.size` *after* the observations have already
+    // been processed — so a channel loaded on the head path was loaded
+    // silently and never reached the sidebar until some unrelated device
+    // showed up. Now the head path loads it by id and says so.
+    const poller = new Poller(bob.session, bob.events)
+    let shellNudges = 0
+    poller.listeners = {
+      onNewDevice: () => {
+        shellNudges++
+      },
+    }
+    // Sweep suppressed on both ticks: whatever happens here is the head path.
+    const pinSweep = () => ((poller as unknown as { lastSweepAt: number }).lastSweepAt = Date.now())
+    // Meet Alice's beacon first, so her own first-sighting nudge is spent and
+    // anything counted below can only have come from the channel.
+    await alice.writer.bump('startup')
+    pinSweep()
+    await poller.tick()
+
+    const ch = await alice.session.createChannel('head-discovered')
+    const conv: ConvId = `chan:${ch.channelId}`
+    const stem = await sendMessage(alice, conv, 'first one in')
+    alice.writer.noteOwnEvent(conv, `${stem}.msg.e1`)
+    await alice.writer.bump('event')
+    expect(bob.session.channels.has(ch.channelId)).toBe(false)
+
+    shellNudges = 0
+    pinSweep()
+    await poller.tick()
+
+    expect(bob.session.channels.get(ch.channelId)?.name).toBe('head-discovered')
+    expect(bob.events.has(conv, stem)).toBe(true)
+    expect(shellNudges).toBe(1)
+  }, 60_000)
+
+  it('still refuses a send into a channel whose tombstone it has already folded', async () => {
+    // The on-demand load must not become a way back into a deleted channel: a
+    // channel already in the map answers from the map, tombstone and all.
+    const ch = await alice.session.createChannel('closing-time')
+    const conv: ConvId = `chan:${ch.channelId}`
+    await alice.events.publish(conv, 'sys', { t: 'sys', conv, kind: 'channel-deleted', data: {} } satisfies SysPayload)
+    expect(alice.session.channels.get(ch.channelId)!.deletedAt).toBeGreaterThan(0)
+    await expect(sendMessage(alice, conv, 'anyone there?')).rejects.toThrow(/unknown conversation/)
+
+    // And the reader who meets it for the first time through a send: the
+    // metadata loads, the log catches up, the tombstone folds, and the write
+    // is refused — not published into a directory on its way out.
+    expect(bob.session.channels.has(ch.channelId)).toBe(false)
+    await expect(sendMessage(bob, conv, 'hello?')).rejects.toThrow(/unknown conversation/)
+    expect(bob.session.channels.get(ch.channelId)!.deletedAt).toBeGreaterThan(0)
+  }, 60_000)
+
   it('agrees on the home channel: the flagged one, else the oldest', async () => {
     const flagged = await alice.session.createChannel('home', '', { fixed: true })
     await bob.session.loadChannels()

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PrView } from '@shared/types'
 import { TEAM_CONV } from '@shared/constants'
+import { shouldNotifyPr } from '@shared/notifyDecision'
 import { useStore } from '@/store'
 import { IconGitPull } from '@/app/icons'
 import { truncate } from '@/app/chrome'
@@ -59,7 +60,23 @@ export function PrAlert() {
     const previous = seenKeys.current
     seenKeys.current = new Set(prs.map((p) => p.key))
     if (previous === null) return // first real list of the session — seed only
-    const arrived = prs.filter((p) => !p.seen && !previous.has(p.key))
+    // An approved PR is listed from 1.4 on ("Ready to complete") but is nobody's
+    // review to do — it never raises the card, exactly as it never counts in
+    // `PrsStatus.unseen`.
+    //
+    // The device's preference then decides the rest, through the same pure
+    // helper the main-side toast uses: "only mine" keeps the pull requests
+    // waiting on me, "paused" and a running snooze keep none. The badge above
+    // is deliberately not filtered — it counts rather than interrupts.
+    const settings = useStore.getState().settings
+    const now = Date.now()
+    const arrived = prs.filter(
+      (p) =>
+        !p.seen &&
+        p.state?.kind !== 'approved' &&
+        !previous.has(p.key) &&
+        (!settings || shouldNotifyPr({ view: p, meId: status.me?.id ?? null, settings, now })),
+    )
     if (arrived.length === 0) return
     if (useStore.getState().activeConv === TEAM_CONV.prs) return
     setFresh(arrived)

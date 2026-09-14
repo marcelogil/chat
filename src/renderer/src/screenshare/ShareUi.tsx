@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ConvId } from '@shared/types'
 import { useStore } from '@/store'
+import { DRAG, NO_DRAG, overlayChromeInsets } from '@/app/chrome'
 import { Button, Spinner } from '@/ui/atoms'
 import {
   activeAnnounceIn,
@@ -162,7 +163,10 @@ function SourcePicker() {
       role="dialog"
       aria-label="Share your screen"
       onClick={close}
-      style={{ position: 'fixed', inset: 0, zIndex: 900, background: 'var(--bg-overlay)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      // The backdrop covers the shell's drag strip; without NO_DRAG a
+      // click-away in the top ~36 px dragged the window instead of closing
+      // (1.4 — see app/overlayChrome.ts).
+      style={{ ...NO_DRAG, position: 'fixed', inset: 0, zIndex: 900, background: 'var(--bg-overlay)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
@@ -256,7 +260,7 @@ function PermissionPanel() {
   const close = () => useScreenStore.setState({ permissionPanel: false })
 
   return (
-    <div role="dialog" aria-label="Screen recording permission" onClick={close} style={{ position: 'fixed', inset: 0, zIndex: 900, background: 'var(--bg-overlay)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+    <div role="dialog" aria-label="Screen recording permission" onClick={close} style={{ ...NO_DRAG, position: 'fixed', inset: 0, zIndex: 900, background: 'var(--bg-overlay)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div onClick={(e) => e.stopPropagation()} style={{ width: 440, background: 'var(--bg-panel)', borderRadius: 'var(--r-xl)', border: '1px solid var(--border-strong)', boxShadow: 'var(--elev-3)', padding: 24 }}>
         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>Screen Recording permission needed</div>
         <p style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: '19px' }}>
@@ -360,6 +364,8 @@ function PresenterBanner() {
 function ViewerOverlay() {
   const viewing = useScreenStore((s) => s.viewing)
   const presence = useStore((s) => s.presence)
+  const fullscreen = useStore((s) => s.fullscreen)
+  const viewerInsets = overlayChromeInsets(window.bridge.platform, fullscreen)
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -374,13 +380,36 @@ function ViewerOverlay() {
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 800, background: '#000', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', background: 'rgba(0,0,0,0.6)' }}>
-        <span style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>{presenter?.name ?? 'Teammate'}'s screen</span>
+      {/* The viewer's strip sits over the shell's drag region, which Chromium
+          derives from the DOM regardless of z-order — so before 1.4 **Leave**
+          was unclickable with a real mouse (CDP clicks go straight to the DOM,
+          which is why the E2E never saw it). The strip takes the region, its
+          controls opt out, and the content dodges the OS window buttons.
+          See app/overlayChrome.ts. */}
+      <div
+        style={{
+          ...DRAG,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          // ≥ 36 px tall so it covers the shell strip it is taking over.
+          minHeight: 44,
+          paddingTop: 10,
+          paddingBottom: 10,
+          paddingLeft: 16 + viewerInsets.left,
+          paddingRight: 16 + viewerInsets.right,
+          background: 'rgba(0,0,0,0.6)',
+          userSelect: 'none',
+        }}
+      >
+        <span style={{ ...NO_DRAG, fontSize: 13, fontWeight: 600, color: '#fff' }}>
+          {presenter?.name ?? 'Teammate'}'s screen
+        </span>
         <ModeChip mode={viewing.mode} />
         <span style={{ flex: 1 }} />
         <button
           onClick={() => void leaveViewing()}
-          style={{ border: '1px solid rgba(255,255,255,0.3)', color: '#fff', background: 'rgba(255,255,255,0.08)', borderRadius: 'var(--r-sm)', fontSize: 12, fontWeight: 600, padding: '4px 12px', cursor: 'pointer' }}
+          style={{ ...NO_DRAG, border: '1px solid rgba(255,255,255,0.3)', color: '#fff', background: 'rgba(255,255,255,0.08)', borderRadius: 'var(--r-sm)', fontSize: 12, fontWeight: 600, padding: '4px 12px', cursor: 'pointer' }}
         >
           Leave
         </button>

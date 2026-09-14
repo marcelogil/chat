@@ -70,6 +70,8 @@ export function Toasts() {
         //   1100  diagram editor overlay (diagram/DiagramEditor + DiagramRoot)
         //   1000  media lightbox · 990/900/800 update banner, share picker,
         //         remote-share viewer · 85 dialogs · < 80 panes and popovers
+        //         (70/71 popovers, 60 quick switcher, 55 the launch nudge —
+        //         a suggestion never covers something the user opened)
         // A toast used to sit at 90, i.e. under every one of those.
         zIndex: 1150,
         display: 'flex',

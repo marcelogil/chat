@@ -42,11 +42,13 @@ export function IconPlus({ size }: IconProps) {
   )
 }
 
+// Feather's "settings" icon (MIT — feathericons.com), swapped in for a
+// sun/asterisk glyph that testers kept misreading as anything but prefs.
 export function IconGear({ size }: IconProps) {
   return (
     <Svg size={size}>
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M12 2.8v2.5M12 18.7v2.5M2.8 12h2.5M18.7 12h2.5M5.4 5.4l1.8 1.8M16.8 16.8l1.8 1.8M18.6 5.4l-1.8 1.8M7.2 16.8l-1.8 1.8" />
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </Svg>
   )
 }
@@ -265,3 +267,25 @@ export function IconCollapse({ size }: IconProps) {
   )
 }
 
+
+/** Notification controls (1.4) — the bell that opens the quick-controls popover. */
+export function IconBell({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M18 9a6 6 0 1 0-12 0c0 4.2-1.5 5.6-2 6.4-.2.4.1.9.6.9h14.8c.5 0 .8-.5.6-.9-.5-.8-2-2.2-2-6.4z" />
+      <path d="M10 19.5a2.2 2.2 0 0 0 4 0" />
+    </Svg>
+  )
+}
+
+/** The same bell with a slash: alerts are paused, or silenced outright. */
+export function IconBellOff({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M18 9a6 6 0 0 0-8.6-5.4" />
+      <path d="M6.2 7.2A6 6 0 0 0 6 9c0 4.2-1.5 5.6-2 6.4-.2.4.1.9.6.9h13" />
+      <path d="M10 19.5a2.2 2.2 0 0 0 4 0" />
+      <path d="M3.5 3.5l17 17" />
+    </Svg>
+  )
+}

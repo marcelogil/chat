@@ -11,6 +11,7 @@ import {
 } from '../crypto/identity'
 import type { SecretStore } from '../store/secretStore'
 import type { ShareIo } from './shareIo'
+import { provenSameMachine } from './supersede'
 
 // Device roster: signed self-registrations on the share, TOFU pins locally.
 // A device record is self-certifying — the edPub inside must hash to the
@@ -100,6 +101,7 @@ export class Roster {
       if (this.entries.has(deviceId)) continue
       await this.loadOne(deviceId)
     }
+    this.healFlags() // judged against the whole listing, not the part read so far
   }
 
   async loadOne(deviceId: string): Promise<RosterEntry | null> {
@@ -113,6 +115,75 @@ export class Roster {
       return this.ingest(deviceId, signed)
     } catch {
       return null // corrupt/foreign — skip, never crash
+    }
+  }
+
+  /**
+   * Does this record take a display name already pinned to somebody else —
+   * the impersonation warning?
+   *
+   * A pin that is the *same person on the same machine* is not somebody else:
+   * it is the registration a "Reset local data" + re-join left behind (1.4,
+   * `supersede.ts`). Without this, the fix that hides the ghost leaves the
+   * real person wearing a permanent red chip on every teammate's screen —
+   * the sidebar DM row, the members rail, the group dialog — because TOFU
+   * fired the moment the new record landed.
+   *
+   * It takes a *proven* machine match (`provenSameMachine`): the two records
+   * carry the same `machineIdHash`, which on macOS and Windows is a hash of
+   * the hardware UUID and survives any amount of local wiping. A missing
+   * fingerprint keeps the warning — silence is not evidence, and this is the
+   * one place in the re-join story where being wrong is a security answer
+   * rather than a layout one.
+   *
+   * Liveness is deliberately not part of it: two live instances on one
+   * machine under one name are not impersonation either, and `ingest` has no
+   * beacons to read.
+   */
+  private nameCollision(rec: DeviceRecord): boolean {
+    for (const p of this.pins.values()) {
+      if (p.deviceId === rec.deviceId) continue
+      if (p.trust === 'revoked') continue
+      if (p.displayName !== rec.displayName) continue
+      // `machineIdHash` lives on the record, not the pin, so this can only
+      // answer for a device whose record is loaded. Until it is, the pin
+      // reads as fingerprint-less and the flag stands — `healFlags()` comes
+      // back for it once the whole listing is in.
+      const known = this.entries.get(p.deviceId)?.record
+      const same = provenSameMachine(
+        { displayName: rec.displayName, hostname: rec.hostname, machineIdHash: rec.machineIdHash },
+        { displayName: p.displayName, hostname: p.hostname, machineIdHash: known?.machineIdHash ?? null },
+      )
+      if (!same) return true
+    }
+    return false
+  }
+
+  /**
+   * Re-ask the impersonation question for every flagged pin, now that the
+   * whole listing is in. `ingest` can only judge against the records loaded
+   * *before* it, and the device directory is listed in filename (= key hash)
+   * order — so whether a re-joined device's own record is read before or
+   * after its predecessor's is a coin flip that lands the same way on every
+   * launch. Without this pass, half of all re-joins would wear the chip for
+   * ever, and every client that flagged one before this rule existed would
+   * keep doing so.
+   *
+   * Only ever relaxes `flagged` → `pinned`: `revoked` and a hand-set
+   * `trusted` are decisions.
+   */
+  private healFlags(): void {
+    let changed = false
+    for (const pin of this.pins.values()) {
+      if (pin.trust !== 'flagged') continue
+      const rec = this.entries.get(pin.deviceId)?.record
+      if (!rec || this.nameCollision(rec)) continue
+      pin.trust = 'pinned' // entries hold this very object, so the view follows
+      changed = true
+    }
+    if (changed) {
+      this.savePins()
+      this.onChange?.()
     }
   }
 
@@ -131,9 +202,7 @@ export class Roster {
     if (!pin) {
       // TOFU: first sight of this deviceId. Flag when the display name is
       // already pinned to a DIFFERENT device — the impersonation warning.
-      const nameCollision = [...this.pins.values()].some(
-        (p) => p.displayName === rec.displayName && p.deviceId !== deviceId && p.trust !== 'revoked',
-      )
+      const nameCollision = this.nameCollision(rec)
       pin = {
         deviceId,
         edPub: rec.edPub,
@@ -148,9 +217,22 @@ export class Roster {
     } else if (pin.edPub !== rec.edPub) {
       // Impossible for a matching deviceId (id = hash of key) — but guard anyway.
       return null
-    } else if (pin.displayName !== rec.displayName) {
-      pin.displayName = rec.displayName
-      this.savePins()
+    } else {
+      if (pin.displayName !== rec.displayName) {
+        pin.displayName = rec.displayName
+        this.savePins()
+      }
+      // Drop a flag that no longer describes anything (1.4). A client that
+      // pinned this device before the re-join rule existed — or before the
+      // predecessor's own record had been read — holds a `flagged` pin for
+      // the one device the person is actually using, and nothing else would
+      // ever clear it: a chip that says "impersonator" on the survivor of a
+      // reset, for good. Only ever relaxes `flagged`; `revoked` and a
+      // hand-set `trusted` are decisions, not guesses.
+      if (pin.trust === 'flagged' && !this.nameCollision(rec)) {
+        pin.trust = 'pinned'
+        this.savePins()
+      }
     }
 
     const entry: RosterEntry = { record: rec, pin, edPubKey }

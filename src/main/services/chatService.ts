@@ -36,10 +36,13 @@ import {
   pollNotifySnippet,
   validatePollDraft,
 } from '@shared/poll'
-import { isChanConv, isDmConv, isGrpConv, isTeamConv } from '@shared/ids'
+import { isChanConv, isDmConv, isGrpConv, isTeamConv, sanitizeHostname } from '@shared/ids'
+import { shouldNotifyChat } from '@shared/notifyDecision'
 import { EventStore } from '../transport/events'
 import { BeaconWriter } from '../transport/beacon'
+import { fingerprintFromEdPub } from '../crypto/identity'
 import { Poller } from '../transport/poller'
+import { selfPresenceView } from '../transport/selfPresence'
 import type { IoTier } from './ioTier'
 import type { Session } from '../transport/session'
 import { boardLiveIsFresh, boardLiveNotifyLine } from './boards'
@@ -91,7 +94,7 @@ export class ChatService {
     private getWindow: () => BrowserWindow | null,
     private getSettings: () => SettingsView,
     /** This build's version, for the beacon's `app` field. Injected for tests. */
-    getAppVersion: () => string = () => '',
+    private getAppVersion: () => string = () => '',
   ) {
     this.events = new EventStore(session)
     this.beacon = new BeaconWriter(session, getAppVersion)
@@ -110,6 +113,36 @@ export class ChatService {
     this.push = push
   }
 
+  /**
+   * This device's own presence row (1.4). The poller's list is everyone else
+   * by construction, so the footer had nothing to show: the status you set was
+   * live on the share and invisible at home. Built from the live beacon, so it
+   * is true the instant setStatus/setAppearState returns.
+   */
+  selfPresence(): PresenceView {
+    const s = this.session
+    const entry = s.roster.all().find((e) => e.record.deviceId === s.deviceId)
+    return selfPresenceView({
+      deviceId: s.deviceId,
+      name: s.displayName,
+      hostname: sanitizeHostname(entry?.record.hostname ?? ''),
+      fingerprint: entry ? fingerprintFromEdPub(entry.pin.edPub) : s.identity.fingerprint,
+      presence: this.beacon.presence,
+      nowMs: s.io.calibratedNow(),
+      app: this.getAppVersion(),
+    })
+  }
+
+  /** Change this device's beacon presence and tell the renderer at once. */
+  setOwnPresence(p: Partial<{ state: 'online' | 'offline'; status: string; idleSec: number }>): void {
+    this.beacon.setPresence(p)
+    this.pushSelfPresence()
+  }
+
+  pushSelfPresence(): void {
+    this.push({ kind: 'self-presence', view: this.selfPresence() })
+  }
+
   async start(): Promise<void> {
     const s = this.session
 
@@ -126,8 +159,20 @@ export class ChatService {
       }
     })
 
+    // The other on-demand-load path (poller.ts's head discovery already nudges
+    // via onNewDevice below): a publish into a channel this session only knew
+    // by id loads it just-in-time, and the sidebar needs its name the moment
+    // that happens, not on the next unrelated push.
+    this.events.onChannelDiscovered(() => void this.pushChannels())
+
     this.poller.listeners = {
-      onPresence: (views: PresenceView[]) => this.push({ kind: 'presence', views }),
+      onPresence: (views: PresenceView[]) => {
+        this.push({ kind: 'presence', views })
+        // Our own row rides the same beat (no share I/O — it is read off the
+        // local beacon): the footer dot follows the idle tier like everyone
+        // else's, instead of freezing at whatever it was on launch.
+        this.pushSelfPresence()
+      },
       onTyping: (conv, deviceId, until) => this.push({ kind: 'typing', conv, deviceId, until }),
       onCursors: (conv, deviceId, cursor) => {
         let m = this.remoteCursors.get(conv)
@@ -191,6 +236,10 @@ export class ChatService {
     await this.pushChannels()
     this.pushGroups()
     this.push({ kind: 'presence', views: this.poller.presenceViews() })
+    // Carries the status restored from settings into the footer on the first
+    // paint — the renderer also pulls it in loadTeam(), for the launch where
+    // this push lands before the window is listening.
+    this.pushSelfPresence()
 
     // A backlog left by a previous run. The poller only calls onHealthChange
     // on a degraded→reachable edge, which never happens when the share is
@@ -571,8 +620,20 @@ export class ChatService {
     const mentioned = (p.body.entities ?? []).some(
       (e) => e.type === 'mention' && (e.special === 'here' || e.device === this.session.deviceId),
     )
-    if (!isDm && settings.notifyChannels === 'none') return
-    if (!isDm && settings.notifyChannels === 'mentions' && !mentioned) return
+    // Who may interrupt (1.4): the channel preference, the DM/private-group
+    // switch and "pause everything" all live in one pure decision, shared with
+    // the PR service and the renderer's alert card. `isGrp` is decided there
+    // too — a private group follows the DM switch, not the channel one.
+    if (
+      !shouldNotifyChat({
+        kind: isGrp ? 'grp' : isDmConv(conv) ? 'dm' : 'chan',
+        mentioned,
+        settings,
+        now: Date.now(),
+      })
+    ) {
+      return
+    }
     if (!Notification.isSupported()) return
 
     const entry = this.session.roster.get(event.author)
@@ -614,7 +675,8 @@ export class ChatService {
   /**
    * "Ana opened a live board: Sprint plan" (1.3). A board is an invitation
    * rather than a mention, so the "mentions only" channel setting keeps quiet
-   * instead of guessing; DMs and private groups always toast, like a message.
+   * instead of guessing; DMs and private groups toast like a message, which
+   * from 1.4 means they follow the direct-message switch.
    * The wording itself is pure and unit-tested in boards.ts.
    */
   private maybeNotifyBoardLive(conv: ConvId, event: VerifiedEvent): void {
@@ -631,8 +693,19 @@ export class ChatService {
     if (win?.isFocused()) return // in-app treatment only
     const settings = this.getSettings()
     const isGrp = isGrpConv(conv)
-    const isDm = isDmConv(conv) || isGrp
-    if (!isDm && settings.notifyChannels !== 'all') return
+    // A board is an invitation rather than a mention, so it passes `mentioned:
+    // false` — "mentions only" keeps quiet, exactly as it did before 1.4 — and
+    // picks up the DM switch and the pause for free.
+    if (
+      !shouldNotifyChat({
+        kind: isGrp ? 'grp' : isDmConv(conv) ? 'dm' : 'chan',
+        mentioned: false,
+        settings,
+        now: Date.now(),
+      })
+    ) {
+      return
+    }
     if (!Notification.isSupported()) return
     const who = this.session.roster.get(event.author)?.record.displayName ?? 'Someone'
     const where = isGrp

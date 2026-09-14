@@ -3,7 +3,7 @@
 // self-hosted fonts and a blocked CDN request. See assets.ts.
 import './assets'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Excalidraw, exportToBlob, exportToSvg, loadFromBlob, restoreLibraryItems, serializeAsJSON } from '@excalidraw/excalidraw'
+import { Excalidraw, FONT_FAMILY, exportToBlob, exportToSvg, loadFromBlob, restoreLibraryItems, serializeAsJSON } from '@excalidraw/excalidraw'
 import type { BinaryFiles, ExcalidrawImperativeAPI, LibraryItems } from '@excalidraw/excalidraw/types'
 import type { ExcalidrawElement, NonDeletedExcalidrawElement } from '@excalidraw/excalidraw/element/types'
 import '@excalidraw/excalidraw/index.css'
@@ -12,9 +12,12 @@ import { DIAGRAM_DEFAULT_TITLE, cleanTitle, diagramFileStem } from '@shared/diag
 import { useStore } from '@/store'
 import { Spinner } from '@/ui/atoms'
 import { ConfirmDialog } from '@/app/ChannelMenu'
+import { DRAG, NO_DRAG, overlayChromeInsets } from '@/app/chrome'
 import { IconCollapse, IconExpand } from '@/app/icons'
 import { CloseIcon, DownloadIcon } from '@/content/icons'
-import { LiveCloseDialog, LiveControls, LiveEndedBanner } from './LiveChrome'
+import { LiveCloseDialog, LiveControls, LiveEndedBanner, LiveHint } from './LiveChrome'
+import { escapeAction, type CanvasEscapeState } from './escape'
+import { initialAppState } from './style'
 import { clearDraft, draftRestorable, draftSlotOf, readDraft, writeDraft } from './drafts'
 import { useLiveBoard } from './useLiveBoard'
 import { fullScreenKeyLabel, isFullScreenToggleKey } from './fullscreenKey'
@@ -78,6 +81,10 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
 
   const viewOnly = slot.mode === 'view'
   const theme = settings?.theme === 'light' ? 'light' : 'dark'
+  // How far the header's content has to stay clear of the OS's own window
+  // controls — the macOS traffic lights sit *on top* of this overlay, which is
+  // why the title input used to be printed under them (1.4 tester report).
+  const insets = overlayChromeInsets(window.bridge.platform, fullscreen)
 
   const convLabel = useMemo(() => {
     const ch = channels.find((c) => c.conv === slot.conv)
@@ -123,7 +130,10 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
     restoredDraft.current = restored !== null && slot.scene !== null
     return {
       elements,
-      appState: { viewBackgroundColor: '#ffffff', ...(parsed?.appState ?? {}) },
+      // A brand-new canvas opens clean — straight 1 px strokes, Nunito, no
+      // pencil (1.4, see style.ts). A scene that arrived with its own appState
+      // keeps every value it brought, key by key.
+      appState: initialAppState(parsed?.appState, FONT_FAMILY.Nunito),
       files: (parsed?.files ?? {}) as BinaryFiles,
       scrollToContent: true,
       libraryItems: loadBundledLibraryItems(),
@@ -176,6 +186,9 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   useEffect(
     () => () => {
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current)
+      // The E2E handle set on the Excalidraw callback below: a stale API for a
+      // canvas that is gone would answer questions about nothing.
+      delete (window as unknown as { __sfDiagramApi?: unknown }).__sfDiagramApi
     },
     [],
   )
@@ -236,24 +249,23 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         e.stopPropagation()
         return
       }
+      // Inside the canvas Escape used to be Excalidraw's unconditionally
+      // (outside fullscreen), which meant an idle canvas swallowed it and the
+      // header's Close button was the only way out — and in 1.3 that button
+      // was under the window's drag strip, so there was no way out at all.
+      // Since 1.4 it escalates: Excalidraw keeps it only while it has
+      // something of its own to cancel (a text edit, a dialog, a menu, a
+      // selection, an armed tool), then fullscreen, then the editor. See
+      // escape.ts for the rule and its tests.
       const target = e.target as Element | null
-      if (target?.closest?.('.excalidraw')) {
-        // Inside the canvas Escape is Excalidraw's — it leaves a text element,
-        // drops a selection, closes a panel. The one exception is fullscreen:
-        // there the canvas fills the screen, so Escape from it is the only way
-        // out that a person will look for, and swallowing it there was leaving
-        // people with no window chrome and no way back. Still Excalidraw's
-        // while it is mid-text-edit or holding a dialog open — those have
-        // something of their own to dismiss.
-        if (!fullscreen) return
-        const st = apiRef.current?.getAppState()
-        if (st?.editingTextElement || st?.openDialog) return
-      }
+      const fromCanvas = !!target?.closest?.('.excalidraw')
+      const action = escapeAction(fromCanvas ? canvasEscapeState(apiRef.current) : null, fullscreen)
+      if (action === 'excalidraw') return
       e.stopPropagation()
       e.preventDefault()
       // Esc leaves fullscreen first — a second Esc then closes the editor, same
       // two-step as a confirm dialog swallowing the first Esc above.
-      if (fullscreen) {
+      if (action === 'exit-fullscreen') {
         setFullScreen(false)
         return
       }
@@ -464,18 +476,33 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
       }}
     >
       <header
+        // THE drag strip while the editor is up (1.4). The shell's own
+        // TitleBar is still in the DOM underneath, and Chromium builds the
+        // draggable region from the DOM regardless of z-order — so the top
+        // 36 px of this overlay was draggable no matter what it painted there,
+        // and every control in it was dead to a real mouse (CDP clicks go
+        // straight to the DOM, which is why the E2E never saw it). The fix is
+        // to own the region rather than fight it: the strip drags the window,
+        // every interactive thing in it is NO_DRAG, and the content is inset
+        // past the OS's own controls (overlayChrome.ts).
         style={{
+          ...DRAG,
           // Full screen (1.3): the header collapses to a slim 36px strip —
           // title, the Live pill slot, the fullscreen toggle, Send, Close —
-          // and the canvas below gets the rest of the window.
+          // and the canvas below gets the rest of the window. Windowed it is
+          // 52, comfortably over the shell strip's 36.
           height: fullscreen ? 36 : 52,
           flexShrink: 0,
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          padding: fullscreen ? '0 8px' : '0 12px 0 16px',
+          paddingTop: 0,
+          paddingBottom: 0,
+          paddingLeft: (fullscreen ? 8 : 16) + insets.left,
+          paddingRight: (fullscreen ? 8 : 12) + insets.right,
           borderBottom: '1px solid var(--border-subtle)',
           background: 'var(--bg-panel)',
+          userSelect: 'none',
         }}
       >
         {!fullscreen && (
@@ -493,6 +520,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
           aria-label="Diagram title"
           placeholder={DIAGRAM_DEFAULT_TITLE}
           style={{
+            ...NO_DRAG,
             width: 260,
             padding: '5px 8px',
             border: '1px solid transparent',
@@ -508,7 +536,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         {/* Live boards (1.3): "Start live session" until there is one, then
             the Live pill with everyone drawing, and the host's End. Kept in
             its own module so this header stays one line. */}
-        <span className="sem-live-pill-slot" style={{ display: 'inline-flex', minWidth: 0 }}>
+        <span className="sem-live-pill-slot" style={{ ...NO_DRAG, display: 'inline-flex', minWidth: 0 }}>
           <LiveControls live={live} viewOnly={viewOnly} suppressStart={live.ended && !bannerOff} />
         </span>
         <span style={{ flex: 1 }} />
@@ -519,6 +547,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         {note && (
           <span
             style={{
+              ...NO_DRAG,
               fontSize: 12,
               color: 'var(--warning)',
               minWidth: 0,
@@ -532,7 +561,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         )}
 
         {!fullscreen && (
-          <div style={{ position: 'relative' }}>
+          <div style={{ ...NO_DRAG, position: 'relative' }}>
             <button
               onClick={() => setExportOpen((v) => !v)}
               aria-haspopup="menu"
@@ -545,11 +574,15 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
             </button>
             {exportOpen && (
               <>
-                <div style={{ position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setExportOpen(false)} />
+                {/* The click-away backdrop spans the window from inside a
+                    drag strip, so it has to opt out too — otherwise dismissing
+                    the menu anywhere near the top started a window drag. */}
+                <div style={{ ...NO_DRAG, position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setExportOpen(false)} />
                 <div
                   role="menu"
                   className="sem-popover"
                   style={{
+                    ...NO_DRAG,
                     position: 'absolute',
                     top: '100%',
                     right: 0,
@@ -621,12 +654,23 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
           </button>
         )}
 
-        {/* Esc closes this too, but only while the canvas doesn't own the key
-            — inside it, Escape belongs to Excalidraw. */}
-        <button onClick={tryClose} title="Close" aria-label="Close the diagram editor" style={{ ...chromeBtn, padding: '0 8px' }}>
+        {/* Spelled out rather than a bare ×: this is the way out of a
+            full-window mode, and a tester who could not find it had no way
+            back to the conversation at all (1.4). Esc does the same thing —
+            see escape.ts for when the canvas keeps the key instead. */}
+        <button
+          onClick={tryClose}
+          title="Close the diagram editor (Esc)"
+          aria-label="Close the diagram editor"
+          style={{ ...chromeBtn, padding: '0 10px' }}
+        >
           <CloseIcon size={14} />
+          Close
         </button>
       </header>
+
+      {/* Said once per app session, the first time a board goes live. */}
+      {live.session && <LiveHint convLabel={convLabel} />}
 
       {live.ended && !bannerOff && <LiveEndedBanner onDismiss={() => setBannerOff(true)} />}
 
@@ -634,6 +678,13 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         <Excalidraw
           excalidrawAPI={(api) => {
             apiRef.current = api
+            // A read-only handle for scripts/e2e-drive.mjs (and the dev
+            // console): the canvas's real app state — did Excalidraw actually
+            // adopt the clean defaults? — is otherwise unreachable from
+            // outside this component, and `serializeAsJSON` deliberately drops
+            // the `currentItem*` keys, so the autosaved draft cannot answer it.
+            // Nothing in the app reads this back; the unmount below clears it.
+            ;(window as unknown as { __sfDiagramApi?: unknown }).__sfDiagramApi = api
           }}
           initialData={initialData}
           onChange={(elements) => {
@@ -742,7 +793,11 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
 
 // ---------------------------------------------------------------------------
 
+// Every header control spreads this, so the `no-drag` opt-out (1.4) rides
+// along with it — a new button added to that strip cannot forget it and end up
+// unclickable under the window's drag region.
 const chromeBtn: React.CSSProperties = {
+  ...NO_DRAG,
   display: 'inline-flex',
   alignItems: 'center',
   gap: 6,
@@ -761,6 +816,7 @@ const chromeBtn: React.CSSProperties = {
 }
 
 const menuItem: React.CSSProperties = {
+  ...NO_DRAG,
   display: 'block',
   width: '100%',
   textAlign: 'left',
@@ -772,6 +828,31 @@ const menuItem: React.CSSProperties = {
   fontSize: 13,
   fontFamily: 'var(--font-ui)',
   cursor: 'pointer',
+}
+
+/**
+ * The bits of Excalidraw's app state that decide who owns Escape — the whole
+ * input to `escapeAction` (escape.ts), and the only place this file touches
+ * those field names.
+ *
+ * `null` when there is no canvas yet: then nothing inside it can be claiming
+ * the key, and Escape is the editor's.
+ */
+function canvasEscapeState(api: ExcalidrawImperativeAPI | null): CanvasEscapeState | null {
+  const st = api?.getAppState()
+  if (!st) return null
+  return {
+    editingText: !!st.editingTextElement,
+    dialogOpen: !!st.openDialog,
+    // Menus, the colour popovers and the shape-library sidebar all dismiss on
+    // Escape, and all of them are things a person opened on purpose.
+    menuOpen: !!st.openMenu || !!st.openPopup || !!st.openSidebar || !!st.contextMenu,
+    hasSelection: Object.keys(st.selectedElementIds ?? {}).length > 0,
+    // A drawing tool is armed: Escape puts the pointer back, it does not close
+    // the window somebody was about to draw in.
+    activeTool: st.activeTool?.type ?? 'selection',
+    editing: !!st.editingLinearElement || !!st.croppingElementId,
+  }
 }
 
 /**

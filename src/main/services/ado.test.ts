@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { AdoClient, type AdoResponse, type FetchLike } from './ado'
+import { AdoClient, apiAtLeast, type AdoResponse, type FetchLike } from './ado'
 
 // The whole point of the injectable FetchLike: the mapping table in §2.3 is
 // testable without a network, an Electron runtime, or an Azure DevOps server.
@@ -251,6 +251,89 @@ describe('AdoClient — api-version negotiation', () => {
     expect(r.ok).toBe(false)
     const offered = f.calls.map((x) => versionOf(x.url))
     expect(new Set(offered).size).toBe(offered.length)
+  })
+})
+
+describe('AdoClient — threads and iterations (1.4)', () => {
+  const THREADS = {
+    value: [
+      {
+        id: 11,
+        status: 'active',
+        publishedDate: '2026-09-01T02:00:00Z',
+        comments: [{ id: 1, author: { id: 'u-2', displayName: 'Bo' }, publishedDate: '2026-09-01T02:00:00Z' }],
+      },
+      { id: 12, status: 'fixed', comments: [] },
+      { notAThread: true },
+    ],
+  }
+
+  it('builds the threads URL under pullRequests/{id} and keeps only numeric ids', async () => {
+    const f = fake(json(THREADS))
+    const r = await client(f.fetchImpl).threads('My Project', 'repo 1', 4271)
+    expect(f.calls[0].url).toBe(
+      `${BASE}/My%20Project/_apis/git/repositories/repo%201/pullRequests/4271/threads?api-version=6.0`,
+    )
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.value.map((t) => t.id)).toEqual([11, 12])
+  })
+
+  it('builds the iterations URL the same way', async () => {
+    const f = fake(json({ value: [{ id: 1, createdDate: '2026-09-01T00:00:00Z' }, { id: 2 }] }))
+    const r = await client(f.fetchImpl).iterations('Proj', 'r1', 9)
+    expect(f.calls[0].url).toBe(`${BASE}/Proj/_apis/git/repositories/r1/pullRequests/9/iterations?api-version=6.0`)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.value.map((i) => i.id)).toEqual([1, 2])
+  })
+
+  it('returns "unsupported" without spending a request below API 3.0', async () => {
+    const f = fake(json(THREADS))
+    const c = new AdoClient(f.fetchImpl, { baseUrl: BASE, token: TOKEN, userAgent: 'ua', apiVersion: '2.0' })
+    const t = await c.threads('Proj', 'r1', 1)
+    const i = await c.iterations('Proj', 'r1', 1)
+    expect(t.ok).toBe(false)
+    expect(i.ok).toBe(false)
+    if (!t.ok) expect(t.reason).toBe('unsupported')
+    if (!i.ok) expect(i.reason).toBe('unsupported')
+    expect(f.calls).toEqual([])
+  })
+
+  it('3.0 itself is supported — that is the version the endpoints arrived in', async () => {
+    const f = fake(json(THREADS))
+    const c = new AdoClient(f.fetchImpl, { baseUrl: BASE, token: TOKEN, userAgent: 'ua', apiVersion: '3.0' })
+    expect((await c.threads('Proj', 'r1', 1)).ok).toBe(true)
+    expect(versionOf(f.calls[0].url)).toBe('3.0')
+  })
+
+  it('a mid-flight negotiation down to 2.0 reads as unsupported, not as an error', async () => {
+    // The server refuses 3.2 and names 2.0; the retry at 2.0 404s the resource.
+    const f = fake((call) => (versionOf(call.url) === '3.2' ? outOfRange('2.0') : res({ status: 404, body: '{}' })))
+    const c = new AdoClient(f.fetchImpl, { baseUrl: BASE, token: TOKEN, userAgent: 'ua', apiVersion: '3.2' })
+    const r = await c.threads('Proj', 'r1', 1)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('unsupported')
+    expect(c.apiVersion).toBe('2.0')
+  })
+
+  it('a real failure at a supported version is still an error, with the token redacted', async () => {
+    const f = fake(res({ status: 403, body: JSON.stringify({ message: `denied for ${TOKEN}` }) }))
+    const r = await client(f.fetchImpl).threads('Proj', 'r1', 1)
+    expect(r.ok).toBe(false)
+    if (!r.ok && r.reason === 'error') {
+      expect(r.error.code).toBe('forbidden')
+      expect(r.error.detail).not.toContain(TOKEN)
+    } else {
+      throw new Error('expected an error result')
+    }
+  })
+
+  it('apiAtLeast compares numerically, not as text', () => {
+    expect(apiAtLeast('3.0', '3.0')).toBe(true)
+    expect(apiAtLeast('4.1', '3.0')).toBe(true)
+    expect(apiAtLeast('10.0', '3.0')).toBe(true)
+    expect(apiAtLeast('2.0', '3.0')).toBe(false)
+    expect(apiAtLeast('1.0', '3.0')).toBe(false)
+    expect(apiAtLeast('3', '3.0')).toBe(true)
   })
 })
 

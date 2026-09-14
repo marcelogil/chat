@@ -3,6 +3,7 @@ import type { MessageView } from '@shared/merge'
 import { DIAGRAM, RETENTION } from '@shared/constants'
 import { diagramFileStem, diagramTileKind, diagramTitleOf, fitDiagramBox, isDiagramAttachment } from '@shared/diagram'
 import { useStore } from '@/store'
+import { NO_DRAG } from '@/app/chrome'
 import { safeThumbSrc } from '@/content/parse'
 import { decodeScene } from './codec'
 import { bytesToBase64, fetchBlobScene } from './scene'
@@ -350,7 +351,9 @@ function TileExport({ view, title, onError }: { view: MessageView; title: string
       </button>
       {open && (
         <>
-          <span style={{ position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setOpen(false)} />
+          {/* Spans the shell's drag strip, so it has to opt out of it — see
+              app/overlayChrome.ts. */}
+          <span style={{ ...NO_DRAG, position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setOpen(false)} />
           <span
             role="menu"
             style={{

@@ -1,8 +1,32 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+// The only Electron this file needs is the OS notification the service raises
+// (1.4 gave it preferences worth testing); `BrowserWindow` appears in
+// ChatService's signature as a type, and is stubbed so the import resolves.
+const notifications: { title: string; body: string }[] = []
+vi.mock('electron', () => ({
+  BrowserWindow: class {},
+  Notification: class {
+    static isSupported(): boolean {
+      return true
+    }
+    private rec: { title: string; body: string }
+    constructor(opts: { title: string; body: string }) {
+      this.rec = { title: opts.title, body: opts.body }
+    }
+    on(): this {
+      return this
+    }
+    show(): void {
+      notifications.push(this.rec)
+    }
+  },
+}))
+
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { CalPayload, CalendarEntry, ConvId, PollBody } from '@shared/types'
+import type { BodyEntity, CalPayload, CalendarEntry, ConvId, MsgPayload, PollBody, VerifiedEvent } from '@shared/types'
 import type { PushMessage, SendDraft, SettingsView } from '@shared/bridge'
 import { DIR, TEAM_CONV } from '@shared/constants'
 import { materializeCalendar } from '@shared/calendar'
@@ -425,5 +449,73 @@ describe('polls', () => {
     expect((beacon.heads.get(conv) ?? []).some((h) => h.endsWith('.vot.e1'))).toBe(false)
     expect((beacon.heads.get(conv) ?? []).some((h) => h.endsWith('.msg.e1'))).toBe(true)
     expect((beacon.heads2.get(conv) ?? []).some((h) => h.endsWith('.vot.e1'))).toBe(true)
+  }, 60_000)
+})
+
+// Who may interrupt (1.4). The rules themselves are exhaustively tested in
+// shared/notifyDecision.test.ts; what matters here is that the service asks —
+// with the right conversation kind, against the live settings, every time.
+describe('maybeNotify and the notification preferences (1.4)', () => {
+  const OTHER = 'other-device'
+
+  function msg(conv: ConvId, over: { text?: string; mention?: boolean } = {}): VerifiedEvent {
+    const entities: BodyEntity[] | undefined = over.mention
+      ? [{ type: 'mention', special: 'here', start: 0, end: 5 }]
+      : undefined
+    const payload: MsgPayload = {
+      t: 'msg',
+      conv,
+      author: { device: OTHER, name: 'Bob' },
+      senderSeq: 1,
+      sentWall: Date.now(),
+      body: { kind: 'text', text: over.text ?? 'hello', entities },
+    }
+    return { id: '1700000000000-0000-aabbccdd', type: 'msg', payload, author: OTHER, verified: true, receivedAt: Date.now() }
+  }
+
+  it('gates channels, DMs, private groups and the pause off one set of settings', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-notify-gate-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const prefs: SettingsView = { ...settings(), notifyChannels: 'all', notifyPreviews: true, notifyDms: true }
+    // No window at all reads as "not focused", which is the only case that
+    // reaches the preference check.
+    const chat = new ChatService(session, () => null, () => prefs)
+    const chan: ConvId = `chan:${(await session.createChannel('general')).channelId}`
+    const dm: ConvId = 'dm:00112233445566778899aabb'
+    const grp: ConvId = 'grp:00112233445566778899aabb'
+    const fire = (conv: ConvId, over?: { mention?: boolean }): number => {
+      notifications.length = 0
+      ;(chat as unknown as { maybeNotify(c: ConvId, e: VerifiedEvent): void }).maybeNotify(conv, msg(conv, over))
+      return notifications.length
+    }
+
+    // Out of the box everything talks.
+    expect(fire(chan)).toBe(1)
+    expect(fire(dm)).toBe(1)
+    expect(fire(grp)).toBe(1)
+
+    // notifyDms covers both conversations you were invited into personally,
+    // and leaves the channel preference alone.
+    prefs.notifyDms = false
+    expect(fire(dm)).toBe(0)
+    expect(fire(grp)).toBe(0)
+    expect(fire(chan)).toBe(1)
+
+    // …and the channel preference still leaves those two alone.
+    prefs.notifyDms = true
+    prefs.notifyChannels = 'mentions'
+    expect(fire(chan)).toBe(0)
+    expect(fire(chan, { mention: true })).toBe(1)
+    expect(fire(dm)).toBe(1)
+
+    // The pause outranks all of it, and expires by itself.
+    prefs.notifyChannels = 'all'
+    prefs.snoozeUntil = Date.now() + 3_600_000
+    expect(fire(chan, { mention: true })).toBe(0)
+    expect(fire(dm)).toBe(0)
+    expect(fire(grp)).toBe(0)
+    prefs.snoozeUntil = Date.now() - 1
+    expect(fire(dm)).toBe(1)
+    expect(fire(chan)).toBe(1)
   }, 60_000)
 })
