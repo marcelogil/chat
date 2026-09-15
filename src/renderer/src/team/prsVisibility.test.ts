@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PrState, PrStateKind, PrView } from '@shared/types'
 import {
   applyVisibility,
+  isToggleDisabled,
   readVisibility,
   seenKeys,
   toggleOverdue,
@@ -150,6 +151,21 @@ describe('visibilityNotes', () => {
       '1 overdue pull request hidden — click the count to show them',
       '1 stale pull request hidden — click the count to show them',
     ])
+  })
+})
+
+describe('isToggleDisabled', () => {
+  it('is disabled at zero when not hidden — nothing to hide', () => {
+    expect(isToggleDisabled(0, false)).toBe(true)
+  })
+
+  it('is enabled at zero while hidden — clicking is the only way back', () => {
+    expect(isToggleDisabled(0, true)).toBe(false)
+  })
+
+  it('is enabled with a positive count, hidden or not', () => {
+    expect(isToggleDisabled(1, false)).toBe(false)
+    expect(isToggleDisabled(1, true)).toBe(false)
   })
 })
 

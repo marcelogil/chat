@@ -6,6 +6,7 @@ import {
   EGG_SEEN_KEY,
   EMPTY_EGG_STATE,
   considerEgg,
+  effectiveReducedMotion,
   loadSeen,
   offerEgg,
   rememberSeen,
@@ -93,6 +94,33 @@ describe('considerEgg — off switches', () => {
 
   it('does nothing when the OS asked for reduced motion', () => {
     expect(considerEgg(EMPTY_EGG_STATE, cand(), env({ reducedMotion: true })).outcome).toBe('skip')
+  })
+})
+
+describe('effectiveReducedMotion — "Play them anyway"', () => {
+  it('is the OS value when the override is off', () => {
+    expect(effectiveReducedMotion(true, false)).toBe(true)
+    expect(effectiveReducedMotion(false, false)).toBe(false)
+  })
+
+  it('the override cancels reduced motion when the OS is asking for it', () => {
+    expect(effectiveReducedMotion(true, true)).toBe(false)
+  })
+
+  it('the override does nothing when the OS was never asking for it', () => {
+    expect(effectiveReducedMotion(false, true)).toBe(false)
+  })
+
+  it('feeds straight into considerEgg: overridden, a candidate plays', () => {
+    const reducedMotion = effectiveReducedMotion(true, true)
+    const r = considerEgg(EMPTY_EGG_STATE, cand(), env({ reducedMotion }))
+    expect(r.outcome).toBe('play')
+  })
+
+  it('feeds straight into considerEgg: not overridden, a candidate is skipped', () => {
+    const reducedMotion = effectiveReducedMotion(true, false)
+    const r = considerEgg(EMPTY_EGG_STATE, cand(), env({ reducedMotion }))
+    expect(r.outcome).toBe('skip')
   })
 })
 

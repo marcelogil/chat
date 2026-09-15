@@ -4,7 +4,7 @@ import type { MessageView } from '@shared/merge'
 import { detectEasterEgg, type EasterEgg } from '@shared/easterEggs'
 import { useStore } from '@/store'
 import { arrivedLive } from '@/store/liveEvents'
-import { offerEgg } from '@/app/easterEggQueue'
+import { effectiveReducedMotion, offerEgg } from '@/app/easterEggQueue'
 import { playEasterEgg, prefersReducedMotion } from '@/app/EasterEggOverlay'
 import { eggCandidate } from './eggEligibility'
 
@@ -52,6 +52,10 @@ interface FeedArgs {
 export function useEasterEggFeed({ conv, messages, loaded, selfId, anchorRead }: FeedArgs): (id: string) => void {
   // Absent means on — nobody has ever opened the setting.
   const enabled = useStore((s) => s.settings?.easterEggs !== false)
+  // 1.5.x — Settings → Appearance's "Play them anyway", offered only while
+  // reduced motion is on. Absent means off: reduced motion is an
+  // accessibility signal, not something to override by default.
+  const ignoreReducedMotion = useStore((s) => s.settings?.easterEggsIgnoreReducedMotion === true)
 
   // Only `kind: 'text'`, and never a deleted one: a code block is code (the
   // detector strips fences, but a whole-message code block is the same thing
@@ -79,11 +83,11 @@ export function useEasterEggFeed({ conv, messages, loaded, selfId, anchorRead }:
     baseline.current = loaded ? { conv, ids: new Set(messages.map((m) => m.id)) } : null
   }
 
-  const ctx = useRef({ candidates, selfId, anchorRead, enabled })
-  ctx.current = { candidates, selfId, anchorRead, enabled }
+  const ctx = useRef({ candidates, selfId, anchorRead, enabled, ignoreReducedMotion })
+  ctx.current = { candidates, selfId, anchorRead, enabled, ignoreReducedMotion }
 
   return useCallback((id: string) => {
-    const { candidates: rows, selfId: me, anchorRead: read, enabled: on } = ctx.current
+    const { candidates: rows, selfId: me, anchorRead: read, enabled: on, ignoreReducedMotion: ignore } = ctx.current
     const row = rows.get(id)
     if (!row) return
     const base = baseline.current
@@ -92,7 +96,7 @@ export function useEasterEggFeed({ conv, messages, loaded, selfId, anchorRead }:
         { id, ...row },
         { selfId: me, anchorRead: read, baseline: base === null ? null : base.ids, arrivedLive },
       ),
-      { now: Date.now(), enabled: on, reducedMotion: prefersReducedMotion() },
+      { now: Date.now(), enabled: on, reducedMotion: effectiveReducedMotion(prefersReducedMotion(), ignore) },
     )
     if (egg) playEasterEgg(egg)
   }, [])

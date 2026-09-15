@@ -73,6 +73,19 @@ export const EMPTY_EGG_STATE: EggQueueState = { seen: [], lastPlayAt: 0 }
  */
 export type EggOutcome = 'play' | 'collapse' | 'skip'
 
+/**
+ * 1.5.x — Settings → Appearance's "Play them anyway", offered only while the
+ * OS is actually asking for reduced motion. The override only ever turns
+ * `considerEgg`'s hard-off *off*: an OS that isn't asking for reduced motion
+ * in the first place is untouched by the setting either way. Pulled out as
+ * its own pure function (rather than composed inline where `offerEgg` is
+ * called, in EasterEggFeed.tsx) so the rule is testable in the node suite —
+ * the same reasoning `eggEligibility.ts` is a module of its own.
+ */
+export function effectiveReducedMotion(osReducedMotion: boolean, ignoreReducedMotion: boolean): boolean {
+  return osReducedMotion && !ignoreReducedMotion
+}
+
 export function rememberSeen(seen: readonly string[], id: string): readonly string[] {
   if (seen.includes(id)) return seen
   const next = [...seen, id]

@@ -11,6 +11,7 @@ import { DEFAULT_THRESHOLDS, groupPrs, nextLine, waitLabel } from './prsGroups'
 import type { PrsThresholds } from './prsGroups'
 import {
   applyVisibility,
+  isToggleDisabled,
   readVisibility,
   seenKeys,
   toggleOverdue,
@@ -503,6 +504,13 @@ function TokenCard({ baseUrl }: { baseUrl: string }) {
  * 1.5 — the header's "N overdue"/"N stale" pill, doubling as a hide toggle.
  * Hidden state reads unmistakably at a glance: dimmed, an eye-off glyph, and
  * `aria-pressed` for anyone using a screen reader instead of looking at it.
+ *
+ * 1.5.x — always rendered once a PR is tracked, even at zero: a zero count
+ * that simply vanished used to be indistinguishable from "this build doesn't
+ * have the feature." A zero-count toggle is `aria-disabled` and dimmed
+ * further, *unless* it's already hiding a (now zero) bucket — then it stays
+ * clickable, eye-off glyph and all, so a real hidden state is never a dead
+ * end (`isToggleDisabled`, prsVisibility.ts).
  */
 function CountToggle({
   count,
@@ -517,13 +525,20 @@ function CountToggle({
   hidden: boolean
   onToggle: () => void
 }) {
+  const disabled = isToggleDisabled(count, hidden)
+  const title = disabled
+    ? `No ${word} pull requests right now`
+    : hidden
+      ? `Show ${word} pull requests again`
+      : `Hide ${word} pull requests`
   return (
     <button
       type="button"
       className="sem-focus"
       aria-pressed={hidden}
-      title={hidden ? `Show ${word} pull requests again` : `Hide ${word} pull requests`}
-      onClick={onToggle}
+      aria-disabled={disabled}
+      title={title}
+      onClick={disabled ? undefined : onToggle}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
@@ -531,12 +546,12 @@ function CountToggle({
         border: 'none',
         background: 'transparent',
         padding: 0,
-        cursor: 'pointer',
+        cursor: disabled ? 'default' : 'pointer',
         fontFamily: 'var(--font-ui)',
         fontSize: 11,
         fontWeight: 600,
         color,
-        opacity: hidden ? 0.55 : 1,
+        opacity: disabled ? 0.4 : hidden ? 0.55 : 1,
       }}
     >
       {hidden && <IconEyeOff size={11} />}
@@ -765,7 +780,15 @@ export function PrsPane() {
             {filtered.length}
           </span>
         )}
-        {configured && (overdue > 0 || stale > 0) && (
+        {/*
+          1.5.x — shown whenever a PR is tracked at all, not only once
+          something is overdue or stale: a team that is caught up sees "0
+          overdue · 0 stale" rather than the toggles disappearing, which used
+          to read (on a real build) as "this version doesn't have the
+          feature." `prs`, not `filtered` — "tracked" is the team-wide count,
+          the same word the subtitle above uses.
+        */}
+        {configured && prs.length > 0 && (
           <span
             title={
               // "overdue" is a review SLA and nothing else: a wait on the
@@ -790,25 +813,21 @@ export function PrsPane() {
               flexShrink: 0,
             }}
           >
-            {overdue > 0 && (
-              <CountToggle
-                count={overdue}
-                word="overdue"
-                color="var(--warning)"
-                hidden={visibility.hideOverdue}
-                onToggle={toggleHideOverdue}
-              />
-            )}
-            {overdue > 0 && stale > 0 && <span style={{ color: 'var(--text-3)' }}>·</span>}
-            {stale > 0 && (
-              <CountToggle
-                count={stale}
-                word="stale"
-                color="var(--danger)"
-                hidden={visibility.hideStale}
-                onToggle={toggleHideStale}
-              />
-            )}
+            <CountToggle
+              count={overdue}
+              word="overdue"
+              color="var(--warning)"
+              hidden={visibility.hideOverdue}
+              onToggle={toggleHideOverdue}
+            />
+            <span style={{ color: 'var(--text-3)' }}>·</span>
+            <CountToggle
+              count={stale}
+              word="stale"
+              color="var(--danger)"
+              hidden={visibility.hideStale}
+              onToggle={toggleHideStale}
+            />
           </span>
         )}
         <span

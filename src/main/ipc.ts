@@ -134,6 +134,9 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
     // actually clicked Allow, so "accepted" here means "we asked."
     controller.setSettings({ notificationsAccepted: true })
   })
+  // 1.5.x — Settings → About's headline. `versions` (electron/chrome) is
+  // frozen, so the app's own version rides a new, separate member instead.
+  ipcMain.handle('app:version', () => app.getVersion())
 
   // 1.3: every stub registered here has been replaced by its owning service,
   // so there is no `not-implemented` fallback left to hand the renderer.

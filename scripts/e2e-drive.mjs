@@ -837,6 +837,79 @@ async function main() {
         Array.isArray(teamSettingsEvents) && teamSettingsEvents.length === 1,
         `${Array.isArray(teamSettingsEvents) ? teamSettingsEvents.length : 'n/a'} events`,
       )
+
+      // 1.5.x — the Admin nav gate, rendered: `navFor`'s node-only unit test
+      // (settingsNav.test.ts) never opened a real Settings modal, so a build
+      // could still ship without the entry actually reaching the DOM. Gil is
+      // alive and ready right here, so open Settings the way a person would
+      // (the sidebar gear) and look for it, then close the modal again.
+      const dialogSel = '[role="dialog"][aria-label="Settings"]'
+      const navButtonText = (label) =>
+        `(() => { const b = Array.from(document.querySelectorAll(${JSON.stringify(`${dialogSel} button`)}))` +
+        `.find((x) => (x.textContent || '').trim() === ${JSON.stringify(label)}); return !!b })()`
+      const clickNavButton = (label) =>
+        `(() => { const b = Array.from(document.querySelectorAll(${JSON.stringify(`${dialogSel} button`)}))` +
+        `.find((x) => (x.textContent || '').trim() === ${JSON.stringify(label)}); if (!b) return false; b.click(); return true })()`
+
+      const gilGearClicked = await gil.eval(
+        `(() => { const el = document.querySelector('[aria-label="Open settings"]'); if (!el) return false; el.click(); return true })()`,
+      )
+      const gilDialogSeen = gilGearClicked
+        ? await until(async () => ((await gil.eval(`!!document.querySelector(${JSON.stringify(dialogSel)})`)) === true ? true : undefined), 10000, 300)
+        : false
+      check('gil opens Settings from the sidebar gear', !!gilDialogSeen, gilGearClicked ? '' : 'gear not found')
+
+      const gilHasAdminNav = await gil.eval(navButtonText('Admin'))
+      check('the Admin nav entry renders for Gil', gilHasAdminNav === true, `found=${gilHasAdminNav}`)
+
+      await gil.eval(clickNavButton('Admin'))
+      const gilTeamNameInput = await until(
+        async () => ((await gil.eval(`!!document.querySelector('input[aria-label="Team name"]')`)) === true ? true : undefined),
+        10000,
+        300,
+      )
+      check('clicking Admin shows the Team name field', !!gilTeamNameInput, gilTeamNameInput ? '' : 'timed out')
+
+      // 1.5.x — the app's own version, via the new `app.version()` bridge
+      // member (`window.bridge.versions` only ever carried Electron/Chrome).
+      await gil.eval(clickNavButton('About'))
+      const gilAboutVersion = await until(
+        async () =>
+          ((await gil.eval(`document.querySelector(${JSON.stringify(dialogSel)})?.textContent?.includes('Chat 1.')`)) === true
+            ? true
+            : undefined),
+        10000,
+        300,
+      )
+      check('Settings → About shows the app version ("Chat 1.…")', !!gilAboutVersion, gilAboutVersion ? '' : 'timed out')
+
+      await gil.eval(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+      const gilDialogClosed = await until(
+        async () => ((await gil.eval(`!document.querySelector(${JSON.stringify(dialogSel)})`)) === true ? true : undefined),
+        5000,
+        300,
+      )
+      check('Escape closes gil\'s Settings modal', !!gilDialogClosed, gilDialogClosed ? '' : 'still open')
+
+      // The same nav, on an ordinary member: no Admin entry at all.
+      const aliceGearClicked = await alice.eval(
+        `(() => { const el = document.querySelector('[aria-label="Open settings"]'); if (!el) return false; el.click(); return true })()`,
+      )
+      const aliceDialogSeen = aliceGearClicked
+        ? await until(async () => ((await alice.eval(`!!document.querySelector(${JSON.stringify(dialogSel)})`)) === true ? true : undefined), 10000, 300)
+        : false
+      check("alice opens Settings from the sidebar gear", !!aliceDialogSeen, aliceGearClicked ? '' : 'gear not found')
+
+      const aliceHasAdminNav = await alice.eval(navButtonText('Admin'))
+      check("the Admin nav entry is absent for alice (not an admin)", aliceHasAdminNav === false, `found=${aliceHasAdminNav}`)
+
+      await alice.eval(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+      const aliceDialogClosed = await until(
+        async () => ((await alice.eval(`!document.querySelector(${JSON.stringify(dialogSel)})`)) === true ? true : undefined),
+        5000,
+        300,
+      )
+      check("Escape closes alice's Settings modal", !!aliceDialogClosed, aliceDialogClosed ? '' : 'still open')
     } finally {
       try { procE.kill() } catch {}
       procE = null
@@ -2314,6 +2387,31 @@ async function main() {
       'pull-request pane screenshot',
       await paneShot(alice, 'Pull requests', join(SHOTS, 'e2e-prs.png')),
       join(SHOTS, 'e2e-prs.png'),
+    )
+
+    // 1.5.x — the header always shows both toggles once a PR is tracked, even
+    // at zero: a real "nothing overdue, nothing stale" must not look like the
+    // feature isn't there at all. Two PRs are tracked here, neither overdue
+    // nor stale (default ageH=3, well under the 48h SLA) — exactly that state.
+    const findCountToggle = (word) =>
+      `(() => { const b = Array.from(document.querySelectorAll('button[aria-pressed]'))` +
+      `.find((x) => (x.textContent || '').trim() === ${JSON.stringify(`0 ${word}`)}); ` +
+      `return b ? { text: b.textContent.trim(), title: b.title, pressed: b.getAttribute('aria-pressed'), disabled: b.getAttribute('aria-disabled') } : null })()`
+    const zeroOverdueBtn = await alice.eval(findCountToggle('overdue'))
+    check(
+      'the header shows a disabled "0 overdue" toggle even when nothing is overdue',
+      zeroOverdueBtn?.text === '0 overdue' &&
+        zeroOverdueBtn?.disabled === 'true' &&
+        zeroOverdueBtn?.title === 'No overdue pull requests right now',
+      JSON.stringify(zeroOverdueBtn),
+    )
+    const zeroStaleBtn = await alice.eval(findCountToggle('stale'))
+    check(
+      'the header shows a disabled "0 stale" toggle even when nothing is stale',
+      zeroStaleBtn?.text === '0 stale' &&
+        zeroStaleBtn?.disabled === 'true' &&
+        zeroStaleBtn?.title === 'No stale pull requests right now',
+      JSON.stringify(zeroStaleBtn),
     )
 
     // Complete it upstream: a merged PR is the one thing that still leaves the

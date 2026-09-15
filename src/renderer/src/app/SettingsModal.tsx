@@ -16,6 +16,8 @@ import { SectionLabel, Toggle, isMac, truncate } from './chrome'
 import { IconArrowUp, IconLock, IconX } from './icons'
 import { toast } from './toasts'
 import TeamSettings from './TeamSettings'
+import { navFor } from './settingsNav'
+import { prefersReducedMotion } from './EasterEggOverlay'
 
 // Spec §2.6 — settings modal, 720×520, left nav.
 
@@ -23,26 +25,6 @@ import TeamSettings from './TeamSettings'
 // onto a section from the notifications popover, which has no way to reach
 // this component's own state.
 type Section = SettingsSection
-
-/**
- * The left nav for one person (1.5). Everything here is the same for everyone
- * except Admin, which is listed only for an admin — today only Gil (`isGil`,
- * `TEAM_ADMIN_NAMES`). Hiding it is a courtesy, not the enforcement: the rename
- * it offers is refused by `ChatService.renameTeam` and, more to the point,
- * ignored by every other client's fold (main/services/teamSettings.ts).
- */
-function navFor(displayName: string | null | undefined): { id: Section; label: string }[] {
-  return [
-    { id: 'profile', label: 'Profile' },
-    ...(isGil(displayName) ? [{ id: 'admin' as Section, label: 'Admin' }] : []),
-    { id: 'appearance', label: 'Appearance' },
-    { id: 'notifications', label: 'Notifications' },
-    { id: 'privacy', label: 'Privacy' },
-    { id: 'quickMessages', label: 'Quick messages' },
-    { id: 'storage', label: 'Storage & Share' },
-    { id: 'about', label: 'About' },
-  ]
-}
 
 function Segmented<T extends string>({
   value,
@@ -359,6 +341,26 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
                     on={settings.easterEggs !== false}
                     onChange={(v) => void patch({ easterEggs: v })}
                   />
+                  {/*
+                    1.5.x — reduced motion is a hard off for the eggs
+                    (easterEggQueue.considerEgg), and this is the explicit way
+                    back in. Only shown while the OS is actually asking for it
+                    — offering the override with nothing to override would be
+                    a toggle that does nothing.
+                  */}
+                  {prefersReducedMotion() && (
+                    <>
+                      <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: '17px' }}>
+                        macOS Reduce motion is on, so the animations stay off.
+                      </div>
+                      <ToggleRow
+                        label="Play them anyway"
+                        sub="Overrides Reduce motion for the message easter eggs only."
+                        on={settings.easterEggsIgnoreReducedMotion === true}
+                        onChange={(v) => void patch({ easterEggsIgnoreReducedMotion: v })}
+                      />
+                    </>
+                  )}
                 </>
               )}
 
@@ -611,7 +613,9 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
               {section === 'about' && (
                 <>
                   <div>
-                    <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-1)' }}>Chat</div>
+                    <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-1)' }}>
+                      <AppVersionTitle />
+                    </div>
                     <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 4 }}>
                       Serverless team chat over an encrypted shared folder.
                     </div>
@@ -643,6 +647,31 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
       </div>
     </div>
   )
+}
+
+/**
+ * 1.5.x — Settings → About's headline. `window.bridge.versions` (frozen)
+ * only ever carried Electron/Chrome; the app's own version rides the new
+ * `app.version()` member instead, resolved once and shown as "Chat X.Y.Z"
+ * once it lands. Reads as plain "Chat" for the one frame before it resolves.
+ */
+function AppVersionTitle() {
+  const [version, setVersion] = useState<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    void window.bridge.app
+      .version()
+      .then((v) => {
+        if (alive) setVersion(v)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  return <>{version ? `Chat ${version}` : 'Chat'}</>
 }
 
 /**

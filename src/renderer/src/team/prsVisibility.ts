@@ -62,6 +62,19 @@ export function applyVisibility(prs: PrView[], visibility: PrsVisibility): PrVie
   return prs.filter((p) => !isHidden(p, visibility))
 }
 
+/**
+ * 1.5.x — the header always shows both toggles once at least one PR is
+ * tracked, even at a zero count: a real "nothing overdue" must never look
+ * identical to "the toggle isn't there because the feature didn't ship."
+ * A zero-count toggle is disabled — there's nothing for it to hide — *unless*
+ * it is already hiding a (now zero) bucket, in which case the click is the
+ * only way back to seeing everything. Pure so PrsPane and its tests don't
+ * have to duplicate the rule.
+ */
+export function isToggleDisabled(count: number, hidden: boolean): boolean {
+  return count === 0 && !hidden
+}
+
 function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`
 }

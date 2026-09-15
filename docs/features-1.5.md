@@ -339,6 +339,9 @@ is what the E2E script watches for.
 reduced-motion override. `SettingsView.easterEggs?: boolean` is the only
 bridge surface this feature touches.
 
+When the OS is actually asking for reduced motion, a second, additive toggle
+appears underneath — "Play them anyway" (`SettingsView.easterEggsIgnoreReducedMotion?: boolean`, default false) — the explicit way to see the eggs without turning Reduce motion off system-wide; see `docs/contract-changes-1.5.md`.
+
 ## 4. Pull-request header toggles
 
 Two per-device switches on the pull-requests pane header, next to the

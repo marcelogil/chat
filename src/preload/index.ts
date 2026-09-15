@@ -35,6 +35,7 @@ const bridge: BridgeApi = {
     launchInfo: () => invoke('app:launchInfo'),
     setOpenAtLogin: (on) => invoke('app:setOpenAtLogin', on),
     testNotification: () => invoke('app:testNotification'),
+    version: () => invoke('app:version'),
   },
 
   onboarding: {

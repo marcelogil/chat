@@ -210,6 +210,13 @@ export interface SettingsView {
   notificationsAccepted?: boolean
   /** 1.5 — play the message easter eggs (a bug running across the window, confetti). Default on. */
   easterEggs?: boolean
+  /**
+   * 1.5.x — play the easter eggs even while the OS asks for reduced motion.
+   * Default off: reduced motion is an accessibility signal, not a preference
+   * to override by default. Offered only in Settings → Appearance, and only
+   * when reduced motion is actually on right now.
+   */
+  easterEggsIgnoreReducedMotion?: boolean
   /** 1.5 — keep this device's presence green regardless of idle time or a locked screen (only offered to Gil). */
   alwaysOnline?: boolean
   /**
@@ -340,6 +347,8 @@ export interface BridgeApi {
     setOpenAtLogin(on: boolean): Promise<{ openAtLogin: boolean }>
     /** 1.4: show a sample OS notification (triggers the macOS permission prompt on first use). */
     testNotification(): Promise<void>
+    /** 1.5.x: `app.getVersion()` — Settings → About's headline. `versions` above is frozen; this is additive. */
+    version(): Promise<string>
   }
 
   onboarding: {

@@ -255,6 +255,56 @@ instance that follows it.
   bookkeeping, and `maybeNotify` returns early for `isTeamConv`, so a rename is
   an in-app toast and never an OS notification.
 
+## 2026-09-15 — `SettingsView.easterEggsIgnoreReducedMotion`: an explicit way back into the eggs
+
+**Renderer + `src/shared/bridge.ts` only.** A gap found on a real 1.5 build:
+`prefers-reduced-motion: reduce` is a hard off for the message easter eggs
+(`considerEgg`, `src/renderer/src/app/easterEggQueue.ts`), with no way in the
+product to see them anyway short of turning off the OS setting itself — which
+is not always this person's call (a managed machine, a shared login) and not
+always what "leave reduced motion on for everything else, but let me have the
+confetti" means.
+
+`SettingsView` gains one more optional boolean, additive like `easterEggs`
+before it:
+
+```ts
+easterEggsIgnoreReducedMotion?: boolean // default false
+```
+
+Default **false**, unlike `easterEggs` — reduced motion is an accessibility
+signal, and defaulting the override *on* would mean a fresh profile ignores it
+without anyone choosing that. It is not written into `DEFAULT_SETTINGS`'s
+sibling fields' pattern uniformly: this one **is** given an explicit `false`
+entry in `DEFAULT_SETTINGS` (`src/main/appController.ts`) rather than left
+absent, since unlike `easterEggs` (whose contract says "default on" and is
+therefore represented by *absence*), this one has no analogous need to stay
+unwritten — an explicit `false` and an absent value already mean the same
+thing everywhere it is read (`=== true`).
+
+Wiring, entirely renderer-side:
+
+- **`easterEggQueue.ts` gains `effectiveReducedMotion(osReducedMotion,
+  ignoreReducedMotion)`**, a one-line pure function (`os && !ignore`) rather
+  than composing the two booleans inline where `offerEgg` is called
+  (`EasterEggFeed.tsx`) — the same reasoning `eggEligibility.ts` is its own
+  module: vitest here is node-only, so logic left inside a `.tsx` component
+  cannot be unit-tested at all. `considerEgg` itself is unchanged; it still
+  takes one `reducedMotion` boolean and still does not know why it is what it
+  is. `EasterEggFeed.tsx` now computes `effectiveReducedMotion(
+  prefersReducedMotion(), ignoreReducedMotion)` and passes that as `EggEnv`'s
+  `reducedMotion`.
+- **Settings → Appearance** shows the override only when
+  `prefersReducedMotion()` is true right now: a note ("macOS Reduce motion is
+  on, so the animations stay off") plus a second toggle, "Play them anyway",
+  directly under the existing "Message easter eggs" row. Offering a toggle
+  that overrides nothing (reduced motion already off) would be confusing, not
+  helpful.
+
+Check: `src/renderer/src/app/easterEggQueue.test.ts` → "effectiveReducedMotion
+— 'Play them anyway'" (five cases, including two that feed the result straight
+into `considerEgg` to confirm the composition actually changes the outcome).
+
 ## 2026-09-15 — the pull-request "N overdue" / "N stale" hide toggles
 
 **Renderer-only.** Nothing under `src/main`, `src/shared` or `src/preload`

@@ -80,6 +80,9 @@ const DEFAULT_SETTINGS: SettingsView = {
   // 1.4 — the status line under your name. Empty until someone sets one; the
   // beacon is memory only, so this file is what carries it across a restart.
   status: '',
+  // 1.5.x — reduced motion is a hard off for the eggs by default; this is the
+  // explicit opt back in, offered only while reduced motion is actually on.
+  easterEggsIgnoreReducedMotion: false,
 }
 
 export class AppController {
