@@ -192,6 +192,69 @@ async function publishedFrame(
   return (JSON.parse(plain.toString('utf8')) as { p: { elements: { id: string }[]; files?: Record<string, unknown> } }).p
 }
 
+/** The real timer, captured before any test installs a fake clock over it. */
+const realSetTimeout = globalThis.setTimeout
+
+/**
+ * Fake timers over a real filesystem, made deterministic.
+ *
+ * The poll loop re-arms itself only *after* the pass it fired has finished
+ * (`tick` awaits `pollOnce`), and that pass is a real `readdir` on a real temp
+ * directory. `vi.advanceTimersByTimeAsync` yields the real event loop between
+ * timers, but only until it reaches the end of the advance: one extra loop turn
+ * — measured, a single `setImmediate` is enough — leaves the pass in flight when
+ * the advance returns, so the next timer is armed at a *later* fake instant than
+ * the tick that armed it and every poll after it slides past the window a
+ * cadence assertion measures. Idle, the readdir wins that race; under a full
+ * suite run it does not, which is exactly how this test used to fail there and
+ * never on its own.
+ *
+ * `shareQuiet(io)` returns a function that waits — in real time, without moving
+ * the fake clock — until the share has nothing in flight and nothing new
+ * started during the last turn. Awaiting it after every advance means fake time
+ * only ever moves while the service is idle, so every re-arm happens at exactly
+ * the fake instant of the tick that scheduled it.
+ */
+function shareQuiet(io: ShareIo): () => Promise<void> {
+  let started = 0
+  let inFlight = 0
+  const holder = io as unknown as Record<string, unknown>
+  const proto = Object.getPrototypeOf(io) as object
+  for (const name of Object.getOwnPropertyNames(proto)) {
+    const desc = Object.getOwnPropertyDescriptor(proto, name)
+    if (name === 'constructor' || !desc || typeof desc.value !== 'function') continue
+    // Read the method off the instance, not the descriptor: a test that has
+    // already replaced one has to stay replaced.
+    const current = holder[name]
+    if (typeof current !== 'function') continue
+    const inner = (current as (...a: unknown[]) => unknown).bind(io)
+    holder[name] = (...args: unknown[]): unknown => {
+      const out = inner(...args)
+      if (out instanceof Promise) {
+        started += 1
+        inFlight += 1
+        const done = (): void => {
+          inFlight -= 1
+        }
+        out.then(done, done)
+      }
+      return out
+    }
+  }
+  return async () => {
+    for (let i = 0; i < 1000; i++) {
+      const before = started
+      // A real macrotask turn. The fake clock owns the timer globals, so this
+      // is the only way to let a pending fs completion — and every microtask
+      // chained onto it, up to and including the next share call it makes —
+      // run without advancing fake time.
+      await new Promise((res) => realSetTimeout(res, 0))
+      if (inFlight === 0 && started === before) return
+    }
+    throw new Error('share never went quiet')
+  }
+}
+
 afterEach(() => {
   vi.useRealTimers()
 })
@@ -353,24 +416,35 @@ describe('board session lifecycle', () => {
   it('polls on the tier cadence and makes no share I/O at all while paused', async () => {
     const h = await makeHarness('sem-board-tier-')
     const { sessionId } = await h.boards.start(h.conv, 'Sprint plan')
+    // A poll pass is real fs work the loop awaits before re-arming, so every
+    // advance below is followed by `quiet()`: fake time moves only while the
+    // service has nothing in flight. Without it this test measures a cadence
+    // against a timer armed at whatever fake instant a real readdir happened to
+    // land on — see `shareQuiet`.
+    const quiet = shareQuiet(h.session.io)
     // The poll loop is armed by join, so the clock has to be fake by then.
     vi.useFakeTimers()
     await h.boards.join(sessionId, h.conv)
+    await quiet()
 
     // 'idle' is the window visible but untouched for minutes. With a live editor
     // open that is still someone watching, so it polls on the *blurred* cadence
     // rather than anything derived from the idle I/O budget.
     h.tier.value = 'idle'
     await vi.advanceTimersByTimeAsync(BOARD.pollFocusedMs) // the focused timer join armed
+    await quiet() // that pass re-arms on the blurred cadence before the clock moves on
     h.session.io.resetStats()
     await vi.advanceTimersByTimeAsync(BOARD.pollFocusedMs)
+    await quiet()
     expect(h.session.io.stats().total).toBe(0)
     await vi.advanceTimersByTimeAsync(BOARD.pollBlurredMs - BOARD.pollFocusedMs + 50)
+    await quiet()
     expect(h.session.io.stats().total).toBeGreaterThan(0)
 
     h.tier.value = 'paused'
     h.session.io.resetStats()
     await vi.advanceTimersByTimeAsync(BOARD.pollBlurredMs * 3)
+    await quiet()
     expect(h.session.io.stats().total).toBe(0)
 
     // Coming back does not need a re-join: the loop picks itself up. The timer
@@ -378,6 +452,7 @@ describe('board session lifecycle', () => {
     // out that one plus the focused one it re-arms.
     h.tier.value = 'focused'
     await vi.advanceTimersByTimeAsync(BOARD.pollBlurredMs + BOARD.pollFocusedMs + 50)
+    await quiet()
     expect(h.session.io.stats().total).toBeGreaterThan(0)
     await h.boards.leave(sessionId, h.conv)
   }, 60_000)

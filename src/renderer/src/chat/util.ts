@@ -9,6 +9,7 @@ import { diagramPreview } from '@shared/diagram'
 import { pollPreview } from '@shared/poll'
 import { formatBytes } from '@/ui/atoms'
 import { firstLinkOf } from '@/content/parse'
+import { JUMP_FADE_MS, JUMP_HOLD_MS } from '@/search/jump'
 
 export const EMPTY: never[] = []
 
@@ -332,12 +333,27 @@ export const CHAT_CSS = `
 .sem-row:hover .sem-gutter-ts { opacity: 1; }
 .sem-selectable, .sem-selectable * { user-select: text; }
 /* 1.6 — the row a quick-switcher jump landed on. The attribute is what the
-   E2E drive asserts on; the class is here so the selector reads as a state. */
-@keyframes sem-jump-flash { from { background: var(--accent-soft); } to { background: transparent; } }
+   E2E drive asserts on; the class is here so the selector reads as a state.
+   1.6.1: it *holds* the tint (you have to be able to find the row you asked
+   for, and the eye arrives after the animation used to be over), then fades.
+   Both durations come from jump.ts so the class-clearing timer and the
+   animation can never disagree. */
+@keyframes sem-jump-flash {
+  0%, ${((JUMP_HOLD_MS / (JUMP_HOLD_MS + JUMP_FADE_MS)) * 100).toFixed(2)}% {
+    background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent);
+  }
+  100% { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
+/* No motion: the same tint, held for the same time, then simply gone
+   (step-end holds the first keyframe for the whole duration). */
+@keyframes sem-jump-hold {
+  from { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+  to { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
 .sem-row.sem-jump-flash[data-jump-target='1'] {
   background: var(--accent-soft);
   box-shadow: inset 3px 0 0 var(--accent);
-  animation: sem-jump-flash 2s var(--ease-standard) forwards;
+  animation: sem-jump-flash ${JUMP_HOLD_MS + JUMP_FADE_MS}ms var(--ease-standard) forwards;
 }
 .sem-composer { border: 1px solid var(--border-subtle); transition: border-color var(--t-fast) var(--ease-standard); }
 .sem-composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); }
@@ -361,5 +377,8 @@ export const CHAT_CSS = `
 .sem-typing-dot { animation: sem-tdot 1.2s infinite; }
 @media (prefers-reduced-motion: reduce) {
   .sem-typing-dot, .sem-bob-glyph, .sem-skel { animation: none !important; }
+  .sem-row.sem-jump-flash[data-jump-target='1'] {
+    animation: sem-jump-hold ${JUMP_HOLD_MS}ms step-end forwards;
+  }
 }
 `

@@ -1,9 +1,9 @@
-import { POLL, PRESENCE, TEAM_CONV } from '@shared/constants'
+import { BEACON, POLL, PRESENCE, TEAM_CONV } from '@shared/constants'
 import type { BeaconContent, ConvId, DmBeaconSection, PresenceStateKind, PresenceView } from '@shared/types'
 import { fingerprintFromEdPub } from '../crypto/identity'
 import { isChanConv, isTeamConv, sanitizeHostname } from '@shared/ids'
 import { sweepMsFor, tickMsFor, type IoTier } from '../services/ioTier'
-import { BeaconReader, type BeaconObservation } from './beacon'
+import { BeaconReader, GRP_HEADS_RING, HEADS2_RING, type BeaconObservation } from './beacon'
 import type { EventStore } from './events'
 import type { Session } from './session'
 import { supersededDevices } from './supersede'
@@ -227,13 +227,19 @@ export class Poller {
     // the `msg` names out of the 16-slot `heads` ring those readers still ingest
     // from (an unparseable name in there would be skipped, not mistaken for a
     // gap; losing the ring slot is the real cost). Here both rings mean the same
-    // thing, so they go through one loop.
-    const plainHeads = new Map<string, string[]>()
-    for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) plainHeads.set(conv, [...heads])
-    for (const [conv, heads] of Object.entries(obs.content.heads2 ?? {})) {
-      plainHeads.set(conv, [...(plainHeads.get(conv) ?? []), ...heads])
+    // thing, so they go through one loop — but each is ingested against its own
+    // capacity, because `ingestHeads` reads a full ring it recognizes nothing in
+    // as an overflow and falls back to a day scan (1.6.1). Merging them into one
+    // array would mean judging 8 vote names against the 16-name `heads` budget.
+    const plainHeads = new Map<string, { heads: string[]; heads2: string[] }>()
+    const plainRing = (conv: string): { heads: string[]; heads2: string[] } => {
+      const ring = plainHeads.get(conv) ?? { heads: [], heads2: [] }
+      plainHeads.set(conv, ring)
+      return ring
     }
-    for (const [conv, heads] of plainHeads) {
+    for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) plainRing(conv).heads = [...heads]
+    for (const [conv, heads] of Object.entries(obs.content.heads2 ?? {})) plainRing(conv).heads2 = [...heads]
+    for (const [conv, rings] of plainHeads) {
       if (!isChanConv(conv) && !isTeamConv(conv)) continue
       if (isChanConv(conv) && !s.channels.get(conv.slice(5))) {
         // One targeted read of that channel's metadata — the token comes from
@@ -248,7 +254,8 @@ export class Poller {
       }
       // A tombstoned channel is closed: don't re-read a log on its way out.
       if (isChanConv(conv) && s.channels.get(conv.slice(5))?.deletedAt) continue
-      await this.events.ingestHeads(conv as ConvId, heads)
+      if (rings.heads.length) await this.events.ingestHeads(conv as ConvId, rings.heads, BEACON.headsRingSize)
+      if (rings.heads2.length) await this.events.ingestHeads(conv as ConvId, rings.heads2, HEADS2_RING)
     }
     // Channel cursors → delivery/read receipts
     for (const [conv, cursor] of Object.entries(obs.content.cursors ?? {})) {
@@ -265,14 +272,16 @@ export class Poller {
       if (conv) sealed.push([conv, section])
     }
     for (const [conv, section] of sealed) {
-      if (section.heads.length) await this.events.ingestHeads(conv, section.heads)
+      if (section.heads.length) await this.events.ingestHeads(conv, section.heads, BEACON.headsRingSize)
       // Private-group notices in a DM (1.2) travel in their own ring, out of
       // `heads`, so that they never take ring slots from the `msg` names a 1.1
-      // peer reading the same section ingests. Same ingestion, one field over.
-      if (section.grpHeads?.length) await this.events.ingestHeads(conv, section.grpHeads)
+      // peer reading the same section ingests. Same ingestion, one field over —
+      // and each ring carries its own capacity, so the overflow check inside
+      // `ingestHeads` measures a 4-name ring against 4, not against 16.
+      if (section.grpHeads?.length) await this.events.ingestHeads(conv, section.grpHeads, GRP_HEADS_RING)
       // Post-1.2 types inside a sealed section (1.3) — a vote in a DM or a
       // private group. Same reason for the separate ring, same ingestion.
-      if (section.heads2?.length) await this.events.ingestHeads(conv, section.heads2)
+      if (section.heads2?.length) await this.events.ingestHeads(conv, section.heads2, HEADS2_RING)
       this.listeners.onCursors?.(conv, deviceId, section.cursor)
       if (section.typingUntil && section.typingUntil > s.io.calibratedNow()) {
         this.listeners.onTyping?.(conv, deviceId, section.typingUntil)

@@ -612,17 +612,90 @@ what this device can already decrypt.
   sets `pendingJump` *before* switching `activeConv`, so jumping from inside
   the conversation you're already reading still fires. `MessageList` is the
   only consumer: `resolveJump` (`search/jump.ts`) yields `none`/`wait`/
-  `scroll`/`missing` — `wait` (log not loaded yet) deliberately does **not**
-  clear the request, or the first jump into a never-opened conversation would
-  race the log and misfire as `missing`. `scroll` highlights the row
-  (`data-jump-target="1"` on `MessageRow`, `sem-jump-flash` in
-  `chat/util.ts`'s `CHAT_CSS`, `JUMP_FLASH_MS` = 2 s) and scrolls to it one
-  animation frame later (virtuoso needs to lay the rows out first). `missing`
-  — the row was swept by retention before anyone searched for it — toasts
-  "That message is no longer on the share" instead of failing silently.
-  `pendingJump` is cleared on a team-folder change like every other
-  team-scoped slice.
+  `scroll`/`missing` — a row that is **in the rendered list wins over
+  `loaded`** (1.6.1: `loadTeam` prefetched the log long ago, and waiting for
+  this pane's own `ensureEvents` costs the jump its mount), so `wait` is now
+  only "not rendered *and* not loaded" and still deliberately does **not**
+  clear the request. `scroll` highlights the row (`data-jump-target="1"` on
+  `MessageRow`, `sem-jump-flash` in `chat/util.ts`'s `CHAT_CSS`, which derives
+  its `@keyframes` from `JUMP_HOLD_MS` = 4 s + `JUMP_FADE_MS` = 0.8 s, the
+  same two constants `JUMP_FLASH_MS` is the sum of — never type a duration
+  twice) and *lands* it. `missing` — the row was swept by retention before
+  anyone searched for it — toasts "That message is no longer on the share"
+  instead of failing silently. `pendingJump` is cleared on a team-folder
+  change like every other team-scoped slice.
+- **Landing is three rules, and 1.6.0 had none of them** (the shipped jump
+  changed conversation and then visibly did nothing). (1) **Mount at the
+  target**: `ChatPane` keys `MessageList` by conv, so a jump elsewhere
+  remounts it, and virtuoso reads `initialTopMostItemIndex` once — it is now
+  `{ index, align: 'center' }`, computed synchronously in the render that
+  first mounts the list. (2) **Verify the landing frame by frame**: virtuoso
+  measures rows over several frames, so one `scrollToIndex` lands short and
+  the target keeps moving under it; `search/landing.ts` (`isInside`,
+  `nextLandingStep`) owns the 2-consecutive-inside-frames rule and the
+  90-frame budget, and `MessageList` re-asks each frame the row is outside,
+  re-deriving the index from the live `items` every time. (3) **`followOutput`
+  off while landing and for `JUMP_SETTLE_MS` (1.5 s) after**: virtuoso's own
+  at-bottom belief is a debounced stream that is *not* settled when the row
+  arrives, and while it is unsettled any change to `items` (a peer's message
+  landing right behind the jump) reads as new output and snaps to the bottom
+  on top of it — which is why the bug reproduced identically without a
+  remount. It is **not** the unread divider that changes: `ChatPane` captures
+  `anchorRead` once per conversation and holds it while that conversation is
+  open, so nothing the list does can make that row come or go.
+- **A landing suppresses `markRead`, and nothing else does.** The list mounts
+  believing it is at the bottom (`atBottom` starts true, virtuoso's stream is
+  debounced), so mounting at a target used to publish a read cursor for the
+  *newest* message while the person was parked 44 rows above it — badge
+  cleared for messages nobody saw, and a DM peer told "Read". The mark is
+  gated on `jumpingRef`, and `jumping` is in that effect's deps so the end of
+  the settle window re-runs it: reaching the bottom for real marks read
+  exactly as before. `startLanding` also parks `leftAtRef` on the jumped-to
+  id, so the "N new messages" pill counts from where the reader actually is
+  and there is a way back down.
 - **Search never touches the share.** No new event type, no new bridge
   surface, no new IPC handler, no `protocol.json` change — an older client
   is unaffected by construction, since nothing about this feature is on the
   wire for it to see. Full design: `docs/features-1.6.md`.
+- **Scoped search (1.6.1) is the same fold in the right rail.** `RailTab`
+  gains `'search'` (`app/RightRail.tsx`, appended last) and every
+  `ChannelHeader` gets a magnifier before the pinned button whose
+  `aria-label` always starts with `Search in ` — `Search in #<channel>` /
+  `Search in <group>` / `Search in this direct message`, built once in
+  `searchLabelFor` (`search/convSearch.ts`) and reused verbatim by the pane's
+  input and results listbox. `app/ConvSearchPane.tsx` reuses
+  `buildConvIndex`/`searchMessages` over the one conversation and shows
+  **every** hit — `HITS_PER_CONV` is the dropdown's cap, never this one's;
+  only `MAX_HITS` applies, in `flattenHits`, which is why the search runs
+  with `max: SCAN_ALL` (so `result.total` can still say "of N"). Hit rows
+  carry `data-conv-search-hit="1"` + `data-msg-id` and jump through the same
+  `jumpToMessage`/`pendingJump` handshake, leaving the pane and its query
+  open so the results can be walked. **A sixth tab does not fit**: the rail
+  is 320 px, its five single-word labels are ~191 px of text, and a flex item
+  with `min-width: auto` cannot shrink below its own word — the strip only
+  clears the "Close details" **x** because the tabs sit at `padding: '0 6px'`
+  with no gap. Anything added there has to make the row scroll instead.
+
+## Beacon heads overflow (1.6.1)
+
+A ring is the only thing a beacon says about a conversation's recent past, and
+it holds the writer's last N filenames. Publish more than N between two of a
+reader's polls (a paste storm; the 1.6.1 E2E seeds 45 messages in ~1 s while a
+reader at the idle tier polls every 15 s) and the oldest are never advertised
+to anybody — while every surviving name reads back fine, so the
+missing-head rule sees no gap. That left the reader silently behind until the
+blanket sweep (up to 10 min at the idle tier).
+
+- **`EventStore.ingestHeads` treats a ring at capacity in which it recognized
+  nothing as a gap** and falls back to the same bounded `catchUp` — a full ring
+  sharing no name with what we hold cannot prove continuity. "Recognized"
+  counts parked files too (a rekey storm must still cost no scan, the 1.2
+  rule).
+- **Every caller passes that ring's own capacity**: `BEACON.headsRingSize` for
+  `heads` (plain and sealed), `GRP_HEADS_RING` for `grpHeads`, `HEADS2_RING`
+  for `heads2` (both exported from `transport/beacon.ts`). So the plain
+  `heads`/`heads2` pair is ingested as two calls, never merged into one array —
+  merging would judge 8 vote names against a 16-name budget.
+- Reader-side only: no new field, no protocol change, rings written exactly as
+  before. A writer *cannot* fix this — a reader only ever sees the current
+  beacon file, so extra bumps mid-burst change nothing.

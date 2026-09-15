@@ -1,4 +1,4 @@
-import { DST, EVENT } from '@shared/constants'
+import { BEACON, DST, EVENT } from '@shared/constants'
 import { hlcObserve, hlcTick } from '@shared/hlc'
 import { dayShard, eventFileName, isChanConv, isGrpConv, parseEventFileName } from '@shared/ids'
 import type { ConvId, EventPayload, EventType, SignedRecord, VerifiedEvent } from '@shared/types'
@@ -338,15 +338,38 @@ export class EventStore {
     return ingested
   }
 
-  /** Ingest the exact files a peer's beacon `heads` names (zero readdirs). */
-  async ingestHeads(conv: ConvId, headFileNames: string[]): Promise<boolean> {
+  /**
+   * Ingest the exact files a peer's beacon `heads` names (zero readdirs).
+   *
+   * `ringSize` is the capacity of the ring these names came out of — 16 for
+   * `heads` and a sealed section's `heads`, smaller for `grpHeads`/`heads2`.
+   * It is what makes an overflowed ring detectable; see the continuity check
+   * at the bottom.
+   */
+  async ingestHeads(
+    conv: ConvId,
+    headFileNames: string[],
+    ringSize: number = BEACON.headsRingSize,
+  ): Promise<boolean> {
     let sawNew = false
     let mayHaveGap = false
+    /** Advertised names that parse — the ring's real length to a reader. */
+    let advertised = 0
+    /**
+     * Names we can account for without reading anything new: already ingested,
+     * or parked waiting for a key. One of these is the proof of continuity the
+     * overflow check below looks for.
+     */
+    let accounted = 0
     const l = this.log(conv)
     for (const f of headFileNames) {
       const parsed = parseEventFileName(f)
       if (!parsed) continue
-      if (l.events.has(parsed.stem)) continue
+      advertised++
+      if (l.events.has(parsed.stem)) {
+        accounted++
+        continue
+      }
       const day = dayShard(parsed.hlcMs)
       const ev = await this.ingestFile(conv, day, f)
       if (ev) sawNew = true
@@ -354,10 +377,24 @@ export class EventStore {
       // waiting for its key. Treating it as one made every peer bump during a
       // rekey cost a full day-directory walk of the group, over and over, for
       // as long as the rotation took to reach us.
-      else if (!this.isParked(conv, day, f)) mayHaveGap = true
+      else if (this.isParked(conv, day, f)) accounted++
+      else mayHaveGap = true
     }
-    // If the oldest advertised head is still missing, older un-advertised
-    // events may exist too — fall back to a bounded day scan.
+    // An advertised head we could not read means older un-advertised events may
+    // exist too.
+    //
+    // So does a *full* ring in which we recognized nothing (1.6.1). The ring
+    // holds only the writer's last `ringSize` filenames: publish 45 messages
+    // between two of a reader's polls — a paste storm, an import, a burst of
+    // votes — and the 29 oldest are never advertised to anybody. Every one of
+    // the 16 names that survive reads back perfectly, so the missing-head rule
+    // above never fires, and the reader is left silently 29 events behind until
+    // its next blanket sweep (up to 10 minutes away at the idle tier). Not
+    // recognizing a single name in a ring that is at capacity is exactly the
+    // signature of that: in the steady state a reader already holds all but the
+    // newest one or two. A reader meeting a chatty conversation for the first
+    // time trips it too, and should — it needs the history either way.
+    if (advertised >= ringSize && accounted === 0) mayHaveGap = true
     if (mayHaveGap) await this.catchUp(conv)
     return sawNew
   }

@@ -27,7 +27,7 @@ const CALIBRATE_EVERY_MS = 5 * 60_000
  * rekeys are rare — a handful over a group's whole life — and the blanket sweep
  * picks up anything that falls off the end, so this stays small.
  */
-const GRP_HEADS_RING = 4
+export const GRP_HEADS_RING = 4
 
 /**
  * Event types a 1.2 client's filename regex can parse. Anything else (1.3's
@@ -52,7 +52,7 @@ const HEADS_1_2_TYPES = new Set(['msg', 'edt', 'del', 'rct', 'pin', 'sys', 'prv'
  * the only thing riding it today and they arrive in small bursts (one per
  * person, once); the blanket sweep picks up anything that falls off the end.
  */
-const HEADS2_RING = 8
+export const HEADS2_RING = 8
 
 // The beacon: one single-writer file per device whose SEQUENCE lives in the
 // filename, so one readdir of beacon/ per poll tick reveals every device's

@@ -8,21 +8,26 @@ import { Avatar, formatBytes, formatTime, IconButton } from '@/ui/atoms'
 import { SectionLabel, truncate } from './chrome'
 import { IconFile, IconLock, IconPencil, IconPin, IconX } from './icons'
 import { ConvRenameInput } from './ConvRename'
+import ConvSearchPane from './ConvSearchPane'
 import { useBeamTarget, BeamLabel } from './beam'
 import { openDm, useDmMap, useGroupMap } from './dm'
 import { groupMemberRows } from './groupMembers'
 import { PersonLines } from './PersonLines'
 
-// Spec §2.4 — right rail: About / Members / Files / Pinned. Member rows are
-// beam drop targets, same as sidebar DM rows.
+// Spec §2.4 — right rail: About / Members / Files / Pinned / Search. Member
+// rows are beam drop targets, same as sidebar DM rows.
 
-export type RailTab = 'about' | 'members' | 'files' | 'pinned'
+export type RailTab = 'about' | 'members' | 'files' | 'pinned' | 'search'
 
+// Search is last on purpose: it is the one tab that is opened *at* something
+// (the header's magnifier), not browsed to, so it costs the other four nothing
+// by sitting at the end of the row.
 const TABS: { id: RailTab; label: string }[] = [
   { id: 'about', label: 'About' },
   { id: 'members', label: 'Members' },
   { id: 'files', label: 'Files' },
   { id: 'pinned', label: 'Pinned' },
+  { id: 'search', label: 'Search' },
 ]
 
 function MemberRow({ p, isSelf }: { p: PresenceView; isSelf: boolean }) {
@@ -176,13 +181,19 @@ export default function RightRail({
         minHeight: 0,
       }}
     >
+      {/* Five tabs and a close button inside a 320 px rail: the five labels at
+          the old '0 10px' + gap 2 measure ~304 px on their own, which is the
+          whole content box — every pixel the close button needs comes out of
+          the window's right edge, where AppShell's overflow:hidden clips it.
+          Single-word labels cannot shrink (min-width:auto is their min-content
+          width), so the padding gives instead, and the close button is pinned
+          with flexShrink:0 so it can never be the thing that gives. */}
       <div
         style={{
           height: 44,
           flexShrink: 0,
           display: 'flex',
           alignItems: 'center',
-          gap: 2,
           padding: '0 8px',
           borderBottom: '1px solid var(--border-subtle)',
         }}
@@ -198,7 +209,7 @@ export default function RightRail({
             role="tab"
             style={{
               height: 28,
-              padding: '0 10px',
+              padding: '0 6px',
               borderRadius: 'var(--r-sm)',
               fontSize: 12,
               fontWeight: tab === t.id ? 600 : 400,
@@ -210,9 +221,11 @@ export default function RightRail({
           </button>
         ))}
         <span style={{ flex: 1 }} />
-        <IconButton label="Close details" onClick={onClose}>
-          <IconX size={15} />
-        </IconButton>
+        <span style={{ flexShrink: 0, display: 'inline-flex' }}>
+          <IconButton label="Close details" onClick={onClose}>
+            <IconX size={15} />
+          </IconButton>
+        </span>
       </div>
 
       <div className="sem-scroll" style={{ flex: 1, minHeight: 0, padding: 12 }}>
@@ -375,6 +388,11 @@ export default function RightRail({
             )}
           </div>
         )}
+
+        {/* Keyed by conv: switching conversations with the tab open starts a
+            fresh search rather than showing the old query's hits under a new
+            name (1.6.1). */}
+        {tab === 'search' && <ConvSearchPane conv={conv} key={conv} onClose={onClose} />}
       </div>
     </div>
   )

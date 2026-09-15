@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso } from 'react-virtuoso'
-import type { VirtuosoHandle } from 'react-virtuoso'
+import type { IndexLocationWithAlign, VirtuosoHandle } from 'react-virtuoso'
 import type { ConvId } from '@shared/types'
 import { isDmConv } from '@shared/ids'
 import type { MaterializedLog, MessageView, SysView } from '@shared/merge'
 import { useStore } from '@/store'
 import { toast } from '@/app/toasts'
 import { JUMP_FLASH_MS, isDuplicateInvocation, resolveJump, shouldClear, type PendingJump } from '@/search/jump'
+import { JUMP_SETTLE_MS, isInside, newLanding, nextLandingStep } from '@/search/landing'
 import { formatDayDivider, formatTime } from '@/ui/atoms'
 import { openLiveBoard } from '@/diagram/collab'
 import { boardJoinAction, type LiveBoardEntry } from '@/diagram/live'
@@ -155,6 +156,121 @@ export function MessageList({
    * toast (or a scroll) could fire twice for a single jump.
    */
   const lastHandledJumpRef = useRef<PendingJump | null>(null)
+  /** This list's own DOM root: every landing measurement is scoped to it. */
+  const rootRef = useRef<HTMLDivElement>(null)
+  /** Virtuoso's scrolling element, cached while it stays in the document. */
+  const scrollerRef = useRef<HTMLElement | null>(null)
+  /**
+   * The live `items`, read by the landing loop. It re-derives the row index
+   * every retry rather than trusting the one it started with: a landing spans
+   * many frames, and anything that folds into the log mid-flight (a peer's
+   * message, an edit, a delete) shifts every index after it.
+   */
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+  /**
+   * Where Virtuoso mounts. Latched on the render that first mounts it (below,
+   * past the early returns) because that is the only render it reads the prop
+   * on — and mounting *at* the target is the whole reason a jump into another
+   * conversation is on screen from the first frame instead of scrolling there
+   * from the bottom.
+   */
+  const mountAtRef = useRef<IndexLocationWithAlign | number | null>(null)
+  /**
+   * True while a jump is landing and through the settle window after it, with
+   * `followOutput` off for that whole span. A ref *and* a state: the mount
+   * path has to have it off in the very render that mounts at the target
+   * (before any effect runs), while the state is only there to schedule the
+   * re-render that turns following back on.
+   */
+  const jumpingRef = useRef(false)
+  const [jumping, setJumping] = useState(false)
+  const landingRef = useRef<{ frame: number | null; settle: number | null }>({ frame: null, settle: null })
+
+  const stopLanding = useCallback(() => {
+    const l = landingRef.current
+    if (l.frame !== null) window.cancelAnimationFrame(l.frame)
+    if (l.settle !== null) window.clearTimeout(l.settle)
+    l.frame = null
+    l.settle = null
+  }, [])
+
+  /**
+   * Land on a message and *prove* it landed.
+   *
+   * One `scrollToIndex` is not enough. Virtuoso measures the rows it has just
+   * been handed over several frames, so a scroll issued while the list is
+   * still sizing itself lands short — and the row it aimed at keeps moving as
+   * the rows above it get their real heights. So this measures the target row
+   * against the scroller every frame, re-asks whenever it is outside, and
+   * stops only once it has stayed inside (`nextLandingStep`, search/landing.ts
+   * owns the budget and the streak).
+   *
+   * Cancelled by a newer jump (`stopLanding` above) and by the list going
+   * away, which the loop notices itself: an unmounted root is disconnected.
+   * Deliberately *not* cancelled from an effect cleanup — clearing the request
+   * re-runs the jump effect immediately, and a cleanup would cancel the very
+   * landing it had just asked for.
+   */
+  const startLanding = useCallback(
+    (id: string) => {
+      stopLanding()
+      jumpingRef.current = true
+      setJumping(true)
+      // Where the reader is about to be parked, for the jump pill's count. The
+      // atBottom transition that follows a landing would otherwise mark it at
+      // the *newest* id, and a pill counting messages newer than the newest is
+      // a pill that never appears — leaving no way back to the bottom from a
+      // row 44 messages up.
+      leftAtRef.current = id
+      let state = newLanding()
+      const tick = (): void => {
+        landingRef.current.frame = null
+        const root = rootRef.current
+        // The list went away under the landing — a real unmount, or one of the
+        // early returns below emptying the rows. Let go of `jumping` on the way
+        // out: leaving it latched pins `followOutput` off for the life of this
+        // list, and nothing would ever turn it back on.
+        if (!root?.isConnected) {
+          jumpingRef.current = false
+          setJumping(false)
+          return
+        }
+        const scroller = scrollerOf(root, scrollerRef)
+        const row = root.querySelector<HTMLElement>('[data-jump-target="1"]')
+        // A row virtuoso has not rendered yet is exactly as un-landed as one
+        // scrolled past, and both are answered the same way: ask again.
+        const inside =
+          row !== null && scroller !== null && isInside(row.getBoundingClientRect(), scroller.getBoundingClientRect())
+        if (!inside) {
+          const index = itemsRef.current.findIndex((it) => it.kind === 'msg' && it.m.id === id)
+          if (index >= 0) virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' })
+        }
+        const step = nextLandingStep(state, inside)
+        state = step.state
+        if (step.action === 'retry') {
+          landingRef.current.frame = window.requestAnimationFrame(tick)
+          return
+        }
+        // Landed, or quietly out of budget: hold `followOutput` off a little
+        // longer either way. Virtuoso's own at-bottom belief is not settled the
+        // frame the row arrives, and *any* change to `items` while it is
+        // unsettled — a peer's message landing a beat after the jump — reads to
+        // followOutput as "new output, go to the bottom", undoing a landing
+        // that had just succeeded. (Not the unread divider: ChatPane freezes
+        // `anchorRead` for as long as the conversation stays open, so nothing
+        // this list does can make that row come or go.)
+        landingRef.current.settle = window.setTimeout(() => {
+          landingRef.current.settle = null
+          jumpingRef.current = false
+          setJumping(false)
+        }, JUMP_SETTLE_MS)
+      }
+      landingRef.current.frame = window.requestAnimationFrame(tick)
+    },
+    [stopLanding],
+  )
+
   useEffect(() => {
     if (isDuplicateInvocation(pendingJump, lastHandledJumpRef.current)) return
     // Resolve against the store's live value rather than trust the closed-over
@@ -171,22 +287,20 @@ export function MessageList({
       useStore.getState().clearPendingJump()
     }
     if (action.kind === 'scroll') {
-      const index = action.index
       setFlashId(action.id)
-      // A frame later: virtuoso measures the rows it has just been handed, and
-      // scrolling into a list that has not laid out yet lands short.
-      //
-      // Deliberately *not* cancelled on cleanup: clearing the request one line
-      // above re-runs this effect before the frame arrives, and a cleanup that
-      // cancelled it would cancel the very scroll it had just asked for. After
-      // an unmount the ref is null and the callback does nothing.
-      window.requestAnimationFrame(() => {
-        virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' })
-      })
-    } else if (action.kind === 'missing') {
-      toast(action.toast, 'info')
+      startLanding(action.id)
+      return
     }
-  }, [pendingJump, conv, loaded, items])
+    if (action.kind === 'missing') toast(action.toast, 'info')
+    // A mount that latched onto a target (below) but never became a landing —
+    // the request was withdrawn between that render and this effect — must not
+    // leave `followOutput` off for the life of the list.
+    const l = landingRef.current
+    if (jumpingRef.current && l.frame === null && l.settle === null) {
+      jumpingRef.current = false
+      setJumping(false)
+    }
+  }, [pendingJump, conv, loaded, items, startLanding])
 
   useEffect(() => {
     if (flashId === null) return undefined
@@ -194,23 +308,55 @@ export function MessageList({
     return () => window.clearTimeout(t)
   }, [flashId])
 
+  // Don't leave the settle timer running past the list. Mount-only, and it
+  // clears the *timer* rather than calling `stopLanding`: React.StrictMode runs
+  // this cleanup on its simulated remount, in the same pass the jump effect
+  // started the landing in, so cancelling the frame loop here would kill every
+  // dev-mode jump (`isDuplicateInvocation` then refuses to restart it). The
+  // frame loop needs no cleanup — it stops itself the first frame the root is
+  // disconnected — while a settle timer can only exist a frame or more later,
+  // which is long after StrictMode's extra cleanup has come and gone.
+  useEffect(
+    () => () => {
+      const l = landingRef.current
+      if (l.settle !== null) window.clearTimeout(l.settle)
+      l.settle = null
+    },
+    [],
+  )
+
   // Mark read while parked at the bottom with app focus.
+  //
+  // A landing is the one time the list is not where `atBottom` says it is: it
+  // mounts believing it is at the bottom (that is the initial state) and
+  // virtuoso's own at-bottom stream is debounced, so a mount-at-target jump
+  // would publish a read cursor for the newest message the instant it landed on
+  // a row 44 messages above it — clearing the unread badge for messages nobody
+  // has seen, and telling a DM peer "Read" for one nobody looked at. So a
+  // landing suppresses it, and `jumping` is in the deps precisely so the end of
+  // the settle window re-runs this: reaching the bottom for real marks read
+  // exactly as before.
   useEffect(() => {
     if (!newestId) return
     const mark = (): void => {
-      if (atBottomRef.current && document.hasFocus()) useStore.getState().markRead(conv, newestId)
+      if (jumpingRef.current || !atBottomRef.current || !document.hasFocus()) return
+      useStore.getState().markRead(conv, newestId)
     }
     mark()
     window.addEventListener('focus', mark)
     return () => window.removeEventListener('focus', mark)
-  }, [conv, newestId, atBottom])
+  }, [conv, newestId, atBottom, jumping])
 
   // Track where we left the bottom, for the jump pill count.
   useEffect(() => {
     atBottomRef.current = atBottom
-    if (atBottom) leftAtRef.current = null
-    else if (leftAtRef.current === null) leftAtRef.current = newestId ?? ''
-  }, [atBottom, newestId])
+    // A landing is not an arrival at the bottom, whatever virtuoso still
+    // believes mid-flight: clearing the mark here would throw away the row
+    // `startLanding` parked the reader on. Re-runs on `jumping` so the settle
+    // window ending re-reads a genuine at-bottom.
+    if (atBottom && !jumpingRef.current) leftAtRef.current = null
+    else if (!atBottom && leftAtRef.current === null) leftAtRef.current = newestId ?? ''
+  }, [atBottom, newestId, jumping])
 
   const newCount = useMemo(() => {
     if (atBottom || leftAtRef.current === null) return 0
@@ -284,16 +430,34 @@ export function MessageList({
   // layered over this pane so the composer stays reachable underneath.
   if (loaded && items.length === 0) return null
 
+  // Latched here, not in an effect: this is the render Virtuoso mounts on, and
+  // `initialTopMostItemIndex` is read once, at mount. ChatPane keys this list
+  // by conversation, so a jump elsewhere is always a fresh mount — and a jump
+  // that names a row already in `items` is born centred on it rather than born
+  // at the bottom and scrolled. `loaded` is not consulted on purpose: the rows
+  // being here is the proof (see resolveJump).
+  if (mountAtRef.current === null) {
+    const target =
+      pendingJump && pendingJump.conv === conv
+        ? items.findIndex((it) => it.kind === 'msg' && it.m.id === pendingJump.id)
+        : -1
+    mountAtRef.current = target >= 0 ? { index: target, align: 'center' } : Math.max(0, items.length - 1)
+    // Mounting at a target is itself a landing: following has to be off from
+    // this very render, before the first change to `items` can snap to the
+    // bottom. The jump effect above takes it from here, on this same commit.
+    if (target >= 0) jumpingRef.current = true
+  }
+
   return (
-    <div style={{ position: 'absolute', inset: 0 }}>
+    <div ref={rootRef} style={{ position: 'absolute', inset: 0 }}>
       <Virtuoso<Item>
         ref={virtuosoRef}
         style={{ height: '100%' }}
         data={items}
         computeItemKey={(_i, it) => it.key}
         itemContent={renderItem}
-        followOutput="smooth"
-        initialTopMostItemIndex={Math.max(0, items.length - 1)}
+        followOutput={jumpingRef.current || jumping ? false : 'smooth'}
+        initialTopMostItemIndex={mountAtRef.current}
         atBottomStateChange={(b) => {
           atBottomRef.current = b
           setAtBottom(b)
@@ -339,6 +503,26 @@ export function MessageList({
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * The element a landing measures against. react-virtuoso marks its own
+ * scroller (`data-virtuoso-scroller`), which is the whole contract here; the
+ * search for a child that actually overflows is the fallback for the day that
+ * attribute changes, so a library bump degrades into a slower query rather
+ * than into jumps that silently never land. Cached while it stays in the
+ * document — this runs once a frame.
+ */
+function scrollerOf(root: HTMLElement, cache: { current: HTMLElement | null }): HTMLElement | null {
+  const cached = cache.current
+  if (cached?.isConnected && root.contains(cached)) return cached
+  const marked = root.querySelector<HTMLElement>('[data-virtuoso-scroller="true"]')
+  const found =
+    marked ??
+    Array.from(root.querySelectorAll<HTMLElement>('*')).find((el) => el.scrollHeight > el.clientHeight + 1) ??
+    null
+  cache.current = found
+  return found
+}
 
 function DayDivider({ ms }: { ms: number }) {
   return (

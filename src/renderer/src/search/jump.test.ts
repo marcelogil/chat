@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import type { ConvId } from '@shared/types'
-import { JUMP_MISSING_TOAST, isDuplicateInvocation, resolveJump, shouldClear } from './jump'
+import {
+  JUMP_FADE_MS,
+  JUMP_FLASH_MS,
+  JUMP_HOLD_MS,
+  JUMP_MISSING_TOAST,
+  isDuplicateInvocation,
+  resolveJump,
+  shouldClear,
+} from './jump'
 
 // The `pendingJump` handoff (1.6): the quick switcher asks, the target
 // conversation's MessageList answers. Everything worth getting wrong is here —
@@ -44,6 +52,27 @@ describe('resolveJump', () => {
 
   it('does not call a loaded-but-empty conversation "still loading"', () => {
     expect(resolveJump({ conv: GENERAL, id: 'a' }, ctx({ ids: [] })).kind).toBe('missing')
+  })
+
+  it('scrolls to a row that is already rendered even before the log says loaded (1.6.1)', () => {
+    // `loadTeam` prefetched this log minutes ago; `loaded` only tracks whether
+    // this pane's own `ensureEvents` has come back. Waiting for it means
+    // missing the mount, and the mount is the only moment the list can be
+    // *born* at the target instead of scrolled to it.
+    expect(resolveJump({ conv: GENERAL, id: 'b' }, ctx({ loaded: false }))).toEqual({
+      kind: 'scroll',
+      id: 'b',
+      index: 1,
+    })
+  })
+})
+
+describe('the highlight clock', () => {
+  it('holds, then fades, and the React timer covers both', () => {
+    // CHAT_CSS builds its animation from the same two numbers; if this sum
+    // ever stopped matching, the class would be pulled mid-fade.
+    expect(JUMP_FLASH_MS).toBe(JUMP_HOLD_MS + JUMP_FADE_MS)
+    expect(JUMP_HOLD_MS).toBeGreaterThan(JUMP_FADE_MS)
   })
 })
 

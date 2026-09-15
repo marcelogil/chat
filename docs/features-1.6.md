@@ -178,8 +178,8 @@ would have been the only thing that could.
 | state | outcome |
 | --- | --- |
 | nothing pending, or pending for a different conversation | `none` — leave it alone |
-| this conversation, but `ensureEvents` hasn't resolved for it yet | `wait` — **does not clear** the request |
-| this conversation, loaded, id is among the rendered rows | `scroll` (+ clear) |
+| this conversation and the id is among the rendered rows | `scroll` (+ clear) — `loaded` is *not* consulted (1.6.1, §7) |
+| this conversation, id not rendered, `ensureEvents` hasn't resolved for it yet | `wait` — **does not clear** the request |
 | this conversation, loaded, id is not among the rendered rows | `missing` (+ clear) → toast |
 
 The `wait` case is the one worth being careful about: a log that is still
@@ -190,12 +190,11 @@ the share" before the log even arrived. And `wait` must not clear
 `pendingJump` either, or the request would be silently dropped with nothing
 to retry it once the log does land.
 
-On `scroll`, `MessageList` highlights the row (`flashId`) and, one animation
-frame later — scrolling into a virtualized list that hasn't laid out yet
-lands short — calls `virtuosoRef.current.scrollToIndex({ index, align:
-'center' })`. The highlight is a CSS animation keyed off `data-jump-target`
-(`sem-jump-flash` in `chat/util.ts`'s `CHAT_CSS`) and lasts `JUMP_FLASH_MS`
-(2000 ms) before the attribute comes off.
+On `scroll`, `MessageList` highlights the row (`flashId`) and lands on it —
+in 1.6.0 with a single `scrollToIndex` an animation frame later, which is
+exactly what §7 replaces. The highlight is a CSS animation keyed off
+`data-jump-target` (`sem-jump-flash` in `chat/util.ts`'s `CHAT_CSS`) and
+lasts `JUMP_FLASH_MS` before the attribute comes off.
 
 On `missing` — the retention case: a channel's day-bundle janitor, or a
 group's grace-period sweep, has already removed the message by the time
@@ -295,3 +294,214 @@ section and no jump; it is entirely unaffected by construction, since there
 is nothing on the wire for it to be affected by. A 1.6 client searching
 finds exactly what it could already decrypt and nothing a teammate on an
 older build wrote that this device couldn't already read before 1.6 shipped.
+
+## 6. Scoped search from the conversation header (1.6.1)
+
+> "add a search button on the top right of channels and groups and direct
+> messages to perform a more focused search."
+
+The ⌘K box answers "where on the share was that". Standing inside a
+conversation, the question is usually narrower — "where in *here* did we
+decide that" — and the dropdown is the wrong shape for it: it caps each
+conversation at `HITS_PER_CONV` (3) hits behind a "N more…" row, and it
+closes the moment focus leaves the input. So the same search gets a second
+surface, aimed at one conversation and mounted somewhere that stays open.
+
+**Where it lives.** The right rail gains a fifth tab, `search`
+(`RailTab` in `app/RightRail.tsx`), appended after Pinned, and
+`app/ChannelHeader.tsx` gains a magnifier in the right-hand cluster,
+immediately before the pinned-messages button. The button is the rail's
+existing `onOpenTab` control, so it toggles the rail shut again when the
+rail is already open on that tab — exactly like the pin. Team panes
+(calendar, pull requests) never render `ChannelHeader` and have no rail, so
+there is nothing to open there; their logs carry `cal`/`prs` records, not
+messages, and the ⌘K search already skips them.
+
+**One label, three places.** `searchLabelFor` (`search/convSearch.ts`) builds
+`Search in #general` / `Search in Duo` / `Search in this direct message`, and
+the header button's `aria-label`, the pane's input `aria-label` and the
+results `listbox` all carry that same string: the button and the input it
+opens are one control as far as a screen reader is concerned. A DM's label
+never names the peer — the pane sits *inside* that conversation, and a label
+is read out in places a name shouldn't have to follow.
+
+**The pane** (`app/ConvSearchPane.tsx`, keyed by `conv` in the rail):
+
+- an input that focuses itself on mount (`autoFocus` *and* an effect — a
+  freshly shown panel does not reliably win the focus race), with the same
+  `SEARCH_DEBOUNCE_MS` pause and `MIN_QUERY_CHARS` floor as the switcher;
+- one folded `ConvIndex` for this conversation, cached on its event count
+  and not built at all until somebody searches — the same cache rule
+  `QuickSwitcher.tsx` uses, with the keying by `conv` doing what the
+  switcher's per-conversation map does;
+- **every** hit, newest first, capped only by the global `MAX_HITS` (200).
+  `HITS_PER_CONV` is the dropdown's cap and has no business here: the whole
+  point of the scoped search is that nothing is held back;
+- a count line — "12 matches", or "Showing the newest 200 of 837" when the
+  cap bites — plus the two empty states, "Type at least 2 characters" and
+  "No messages match";
+- rows carrying `data-conv-search-hit="1"` and `data-msg-id`, each showing
+  the author's name (as signed — a device that has since left the share
+  still has to have one), a relative date, and the snippet with `<mark>`
+  around the matched spans, rendered as elements rather than a string of
+  HTML.
+
+**Keyboard and mouse.** ↑/↓ move the cursor (clamped, not wrapped —
+`moveCursor`), Enter jumps to the selected hit, Esc empties the box and,
+when it is already empty, closes the rail: the same two-step Esc the
+fullscreen editor uses, so a typo never costs the whole panel. Rows activate
+on **both** `mousedown` and `click` — `mousedown` so the jump lands before
+focus can move off the input, `click` so anything driving the pane
+synthetically still works — and the pair a real mouse sends jumps once, not
+twice (the row remembers that its own `mousedown` already fired).
+
+**The pane stays open after a jump**, query and all. Walking a result list
+is the reason it exists; closing on the first hit would make the second cost
+the whole query again. The jump itself is the 1.6 handshake untouched —
+`store.jumpToMessage(conv, id)` sets `pendingJump`, `MessageList` resolves it
+(`search/jump.ts`), the row flashes.
+
+**Tests.** `src/renderer/src/search/convSearch.test.ts` covers the label
+(including that every form starts with `Search in `), `flattenHits`
+(one conversation only, newest first, no per-conversation cap, the `MAX_HITS`
+slice), `countLine` (both capped shapes and the singular "1 match"), and
+`moveCursor` (clamping, the empty list, and pulling a stale cursor back into
+a list that shrank under it).
+
+**Compatibility.** Renderer-only, same as the rest of 1.6: no bridge, no
+main, no share I/O, no `protocol.json`. Nothing about this feature is on the
+wire for an older client to see.
+
+## 7. Landing the jump (1.6.1)
+
+The 1.6.0 jump opened the right conversation and then, in a channel with any
+real history, did not arrive: no scroll anyone could see, and no highlight.
+Gil reported it on the shipped build. Three things were wrong, and all three
+had to be fixed for the jump to land.
+
+**1. The list mounts at the bottom, then tries to scroll.** `ChatPane` renders
+`<MessageList key={conv}>`, so a jump into another conversation *remounts* the
+list, and Virtuoso reads `initialTopMostItemIndex` exactly once, at mount.
+1.6.0 always passed `items.length - 1`: the list was born at the newest
+message and had to travel back up through 44 unmeasured rows. It now mounts
+**at the target** —
+
+```tsx
+initialTopMostItemIndex={{ index, align: 'center' }}
+```
+
+— computed synchronously during the render that first mounts the list (a ref
+latched past the early returns, because that is the only render the prop is
+read on). The target index comes from `items`, not from the store's `loaded`
+flag: `loadTeam()` prefetched every log at boot, so a row being *in the list*
+is the proof, and `resolveJump` now answers `scroll` for a rendered row even
+while `ensureEvents` is still in flight (the `wait` case is now only "not
+rendered *and* not loaded").
+
+**2. One `scrollToIndex` is never enough.** Virtuoso measures the rows it has
+just been handed over several animation frames, so a scroll issued into a
+list that has not finished sizing itself lands short — and the row it aimed
+at keeps moving as the rows above it get their real heights. So the list now
+*checks*: every frame it compares the flashed row's rect with the scroller's
+(`data-virtuoso-scroller`, found from the row upwards), re-asks whenever the
+row is outside, and stops only once it has been fully inside on two
+consecutive frames. The judgement is pure and unit-tested in
+`src/renderer/src/search/landing.ts`:
+
+| export | what it decides |
+| --- | --- |
+| `isInside(rowRect, scrollerRect, tolerancePx)` | landed? (2 px of sub-pixel slack; a row taller than the viewport counts when it *covers* it) |
+| `nextLandingStep(state, insideNow)` → `retry` / `done` / `give-up` | the 2-consecutive-frames rule and the 90-frame (~1.5 s at 60 Hz) budget |
+
+`MessageList` supplies the DOM: the two rects, the frame loop, and one
+`scrollToIndex({ index, align: 'center', behavior: 'auto' })` per frame that
+missed. The index is **re-derived from the live `items` every retry**, never
+carried from the start of the loop: a landing spans many frames, and anything
+that folds into the log mid-flight (a peer's message, an edit, a delete)
+shifts every index after it. The loop is cancelled by a newer jump and stops
+itself once the list's root is disconnected — resetting `jumping` on the way
+out, so an early return that empties the rows can never leave `followOutput`
+pinned off for the life of the list. It is deliberately *not* torn down from
+an effect cleanup, since clearing `pendingJump` re-runs that effect
+immediately and the cleanup would cancel the landing it had just asked for;
+the one mount-only cleanup there clears the *settle timer* alone, because
+React.StrictMode runs that cleanup on its simulated remount and cancelling
+the frame loop there would kill every dev-mode jump. Running out of budget is
+silent: a jump that half-landed beats a busy loop.
+
+**3. `followOutput` snapped the list back to the bottom.** Virtuoso's
+`atBottom` is a debounced stream, and around a jump it is not settled: the
+list mounts believing it is at the bottom, and the real answer arrives frames
+later. While it is unsettled, **any** change to `items` — a peer's message
+landing right behind the jump, an edit folding in — reads to
+`followOutput="smooth"` as "new output" and scrolls to the newest row, on top
+of whatever the jump just did. This is why the bug reproduced identically when
+searching from *inside* the conversation being read. So following is off while
+a jump is landing and for `JUMP_SETTLE_MS` (1500 ms) after it lands:
+
+```tsx
+followOutput={jumping ? false : 'smooth'}
+```
+
+and back to `'smooth'` afterwards, unchanged.
+
+It is **not** the unread divider that changes. That row is derived from the
+`anchorRead` prop, and `ChatPane` captures it once when a conversation opens
+and holds it stable for as long as it stays open (`anchor.conv !== conv`),
+precisely so the NEW divider doesn't chase itself — so marking read during a
+session cannot drop that row, change `items.length`, or move anything.
+(Earlier drafts of this document, of `landing.ts` and of `CLAUDE.md` all told
+that story; it was never true of this code.)
+
+**4. Landing on an old message marked the conversation read.** The same
+unsettled `atBottom` has a second consequence, and this one is not cosmetic:
+the markRead effect runs at mount with `atBottomRef` still `true`, so a
+mount-at-target jump published a read cursor for the **newest** message the
+instant it landed on a row 44 messages above it. The sidebar badge went to
+zero for messages nobody had seen, and in a DM the peer's client rendered
+"Read <time>" under a message nobody had looked at. In 1.6.0 that call was
+defensible — the list really did mount at the bottom. Mount-at-target is what
+made it wrong, so a landing now suppresses it:
+
+```tsx
+const mark = (): void => {
+  if (jumpingRef.current || !atBottomRef.current || !document.hasFocus()) return
+  useStore.getState().markRead(conv, newestId)
+}
+```
+
+`jumping` is in that effect's dependency list, so the end of the settle window
+re-runs it — and once the person really reaches the bottom it marks read
+exactly as before. The jump-to-latest pill goes with it: `startLanding` parks
+`leftAtRef` on the jumped-to id, because the `atBottom → false` transition
+that follows a landing would otherwise mark it at the *newest* id, and a pill
+counting messages newer than the newest never appears at all — stranding the
+reader mid-history with no control back to the bottom.
+
+**The highlight now holds.** Gil asked for "a small background color change to
+highlight what we are looking for", and a 2 s fade that started on the first
+frame was mostly over before the eye found the row. The row holds
+`var(--accent-soft)` plus the `inset 3px var(--accent)` bar for
+`JUMP_HOLD_MS` (4000 ms), then fades over `JUMP_FADE_MS` (800 ms).
+`JUMP_FLASH_MS` — the React timer that drops `flashId`, and with it the
+class — is `JUMP_HOLD_MS + JUMP_FADE_MS`, derived rather than typed twice, and
+`CHAT_CSS` builds the `@keyframes` percentage out of the same two constants;
+a row whose class is pulled mid-fade is exactly what two hand-written numbers
+produce. Under `prefers-reduced-motion` there is no animation at all: the same
+tint, held for `JUMP_HOLD_MS` by a `step-end` keyframe, then gone.
+
+### What the E2E proves (`scripts/e2e-drive.mjs`, the 1.6.1 block)
+
+A three-message channel cannot fail this way, so the block seeds one: alice
+sends 45 messages to `#general`, the first being the needle ("needle xyzzy
+one") and the other 44 burying it. Then, for a jump **from another
+conversation** (bob sits in his DM with Alice first, so the list really
+remounts) and again for a jump **from the conversation search** (bob parked at
+the bottom of `#general`), it measures in the page:
+
+- a `[data-jump-target="1"][data-conv=<#general>]` row exists within 5 s,
+- its rect is fully inside its scroller's rect,
+- its computed `background-color` is not fully transparent (the highlight is
+  actually painted),
+- and — the regression check for (3) — it is **still** fully inside two
+  seconds later.

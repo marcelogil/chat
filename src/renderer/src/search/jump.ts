@@ -21,13 +21,30 @@ export interface PendingJump {
 /** What the toast says when retention has already swept the message away. */
 export const JUMP_MISSING_TOAST = 'That message is no longer on the share'
 
-/** How long the target row stays highlighted once it is on screen. */
-export const JUMP_FLASH_MS = 2000
+/**
+ * How long the target row holds its tint before it starts to fade (1.6.1).
+ * A two-second fade-from-the-first-frame was easy to miss entirely: by the
+ * time the eye finds the row the highlight is already half gone. So it holds,
+ * then fades.
+ */
+export const JUMP_HOLD_MS = 4000
+
+/** And how long the fade itself takes. */
+export const JUMP_FADE_MS = 800
+
+/**
+ * How long the target row stays highlighted once it is on screen — the React
+ * timer that drops `flashId`. Derived, never typed twice: CHAT_CSS builds the
+ * same animation out of the same two constants, and a row whose class is
+ * pulled mid-fade (or one still tinted after the animation ended) is exactly
+ * what two hand-written numbers produce.
+ */
+export const JUMP_FLASH_MS = JUMP_HOLD_MS + JUMP_FADE_MS
 
 export type JumpAction =
   /** Not for this list (or nothing pending) — leave the request alone. */
   | { kind: 'none' }
-  /** For this list, but its log has not been read yet. Keep waiting. */
+  /** For this list, not among its rows, and its log is still being read. Wait. */
   | { kind: 'wait' }
   | { kind: 'scroll'; id: string; index: number }
   | { kind: 'missing'; id: string; toast: string }
@@ -44,12 +61,17 @@ export interface JumpContext {
 export function resolveJump(pending: PendingJump | null, ctx: JumpContext): JumpAction {
   if (!pending) return { kind: 'none' }
   if (pending.conv !== ctx.conv) return { kind: 'none' }
+  const index = ctx.indexOf(pending.id)
+  // Being in the rendered list is proof enough (1.6.1): `loaded` only says
+  // whether `ensureEvents` has come back, and `loadTeam` has usually had the
+  // log in memory for minutes by then. Waiting for the flag cost the jump its
+  // one chance to be on screen from the first frame — the list mounts at the
+  // target row or not at all.
+  if (index >= 0) return { kind: 'scroll', id: pending.id, index }
   // A log that is still loading says nothing about whether the message exists,
   // so this must not fall through to 'missing' — that is how a jump into a
   // conversation opened for the first time would always toast.
   if (!ctx.loaded) return { kind: 'wait' }
-  const index = ctx.indexOf(pending.id)
-  if (index >= 0) return { kind: 'scroll', id: pending.id, index }
   return { kind: 'missing', id: pending.id, toast: JUMP_MISSING_TOAST }
 }
 

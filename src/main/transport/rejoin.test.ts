@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { PresenceView } from '@shared/types'
+import type { ConvId, MsgPayload, PresenceView } from '@shared/types'
 import { generateIdentity, type DeviceIdentity } from '../crypto/identity'
 import type { SecretStore } from '../store/secretStore'
 import { BeaconWriter } from './beacon'
@@ -61,6 +61,7 @@ interface Client {
   roster: Roster
   writer: BeaconWriter
   poller: Poller
+  events: EventStore
 }
 
 interface Facts {
@@ -110,7 +111,14 @@ async function team(): Promise<{ newClient: (facts: Facts) => Promise<Client> }>
       recSeq: 1,
     })
     const events = new EventStore(session)
-    return { identity, session, roster, writer: new BeaconWriter(session), poller: new Poller(session, events) }
+    return {
+      identity,
+      session,
+      roster,
+      writer: new BeaconWriter(session),
+      poller: new Poller(session, events),
+      events,
+    }
   }
   return { newClient }
 }
@@ -179,6 +187,48 @@ describe('a person who reset local data and re-joined from the same machine', ()
     expect(bob.session.roster.getPin(newAlice.identity.deviceId)?.trust).toBe('pinned')
     expect(bob.session.roster.getPin(oldAlice.identity.deviceId)?.trust).toBe('pinned')
     expect(onBob.get(newAlice.identity.deviceId)?.trust).toBe('pinned')
+  })
+
+  // The other half of a re-join, and the one nothing covered before 1.6.1: the
+  // ghost is hidden, the new device is pinned — but does what it *writes* still
+  // reach the peer that pinned its predecessor? This is the cheap path (one
+  // beacon read, no directory scan), because the expensive one would mask a
+  // real failure behind a ten-minute sweep at the idle tier.
+  it("delivers the re-joined device's channel messages on the beacon path", async () => {
+    const now = Date.now()
+    const { newClient } = await team()
+    const machine = { hostname: 'Gils-MacBook-Pro.local', machineIdHash: 'mid-gil' }
+    const oldAlice = await newClient({ displayName: 'Gil', ...machine, firstSeen: now - 30 * 86_400_000 })
+    const bob = await newClient({ displayName: 'Bob', hostname: 'bob-box', machineIdHash: 'mid-bob', firstSeen: now })
+    await oldAlice.writer.bump('startup')
+    await bob.writer.bump('startup')
+    await viewsOf(bob) // Bob pins the old device — TOFU, before the reset
+
+    await oldAlice.writer.stop()
+    const newAlice = await newClient({ displayName: 'Gil', ...machine, firstSeen: now })
+    await newAlice.writer.bump('startup')
+    await viewsOf(bob) // …and meets the replacement
+
+    const ch = await newAlice.session.createChannel('general')
+    const conv: ConvId = `chan:${ch.channelId}`
+    const sent = await newAlice.events.publish(conv, 'msg', {
+      t: 'msg',
+      conv,
+      author: { device: newAlice.identity.deviceId, name: 'Gil' },
+      senderSeq: newAlice.session.nextSenderSeq(conv),
+      sentWall: Date.now(),
+      body: { kind: 'text', text: 'back, with a new device id' },
+    } satisfies MsgPayload)
+    newAlice.writer.noteOwnEvent(conv, `${sent.id}.msg.e1`)
+    await newAlice.writer.bump('event')
+
+    // Sweep pinned shut: only the beacon may deliver this.
+    ;(bob.poller as unknown as { lastSweepAt: number }).lastSweepAt = Date.now()
+    await bob.poller.tick()
+    expect(bob.events.has(conv, sent.id)).toBe(true)
+    expect(bob.events.getEvents(conv)[0].verified).toBe(true)
+    // Nothing about the superseded predecessor changes that.
+    expect(bob.session.roster.getPin(newAlice.identity.deviceId)?.trust).toBe('pinned')
   })
 
   it('still flags a namesake arriving from a different machine', async () => {

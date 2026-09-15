@@ -2,10 +2,11 @@ import { useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ConvId } from '@shared/types'
 import { useStore } from '@/store'
+import { searchLabelFor } from '@/search/convSearch'
 import { Avatar, IconButton, identityHue } from '@/ui/atoms'
 import { ShareButton } from '@/screenshare/ShareUi'
 import { truncate } from './chrome'
-import { IconLock, IconPanel, IconPencil, IconPin } from './icons'
+import { IconLock, IconPanel, IconPencil, IconPin, IconSearch } from './icons'
 import { ConvRenameInput } from './ConvRename'
 import { FIXED_CHANNEL_REFUSAL, type RenameKind } from './renamePlan'
 import { useDmMap, useGroupMap } from './dm'
@@ -237,6 +238,22 @@ export default function ChannelHeader({
       )}
 
       <ShareButton conv={conv} />
+      {/* Scoped search (1.6.1). The label is the rail pane's own aria-label,
+          built in one place (searchLabelFor) so the button and the input it
+          opens read as the single control they are. */}
+      <IconButton
+        label={
+          channel
+            ? searchLabelFor('channel', channel.name)
+            : group
+              ? searchLabelFor('group', group.name)
+              : searchLabelFor('dm')
+        }
+        active={railOpen && railTab === 'search'}
+        onClick={() => onOpenTab('search')}
+      >
+        <IconSearch size={16} />
+      </IconButton>
       <IconButton
         label={railOpen && railTab === 'pinned' ? 'Hide pinned messages' : 'Show pinned messages'}
         active={railOpen && railTab === 'pinned'}

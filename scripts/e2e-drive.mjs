@@ -2990,8 +2990,434 @@ async function main() {
     )
     await clearSwitcher(bob)
 
+    // Before the seed below fills alice2's own #general with 45 filler rows —
+    // this shot is of the re-joined sidebar, and a wall of "filler N" in the
+    // pane next to it is not what it was taken for.
     await alice2.screenshot(join(SHOTS, 'e2e-rejoin.png')).catch(() => {})
     soft('re-joined sidebar screenshot', true, join(SHOTS, 'e2e-rejoin.png'))
+
+    // ---- 1.6.1 jump landing + scoped search (begin) ----
+    // 1.6.0 shipped a jump that changed conversation and then quietly failed
+    // to arrive. Two causes, both invisible in a three-message channel:
+    // virtuoso measures rows over several frames, so one early scrollToIndex
+    // lands short; and virtuoso's own at-bottom belief is unsettled around a
+    // jump, so any change to `items` in that window (a peer's message, an
+    // edit) reads to followOutput as "new output" and answers by snapping to
+    // the bottom, on top of whatever the jump did. So this block seeds an
+    // overflow first — the target has to sit far enough up that "never
+    // scrolled" and "scrolled, then snapped back" both look wrong — and then
+    // measures the row against the scroller, twice, two seconds apart.
+    const SEED_TOTAL = 45
+    // The app's own landing slack (src/renderer/src/search/landing.ts). Named
+    // here rather than typed into the page expression below, so the E2E can
+    // never end up asserting a containment rule the app no longer applies.
+    const LANDING_TOLERANCE_PX = 2
+    const NEEDLE = 'needle xyzzy one'
+
+    // (1) From another conversation — the path that remounts the list, and so
+    //     the path that has to mount *at* the target rather than at the bottom.
+    //     Bob steps out of #general *before* the seed arrives, which is what
+    //     makes the unread assertion after the landing mean anything: all 45
+    //     messages are unread to him, and a jump that marks them read on the
+    //     way in is exactly the regression being watched for.
+    // The header's own name, read while #general is still on screen: the DM bob
+    // is about to open may hold no messages at all, and "no message rows from
+    // #general" is equally true of a pane that rendered nothing. The header is
+    // the positive half of the proof — it follows the conversation switch.
+    const generalHeaderLabel = await bob.eval(
+      `(() => { const b = document.querySelector('button[aria-label^="Search in "]'); return b ? b.getAttribute('aria-label') : null })()`,
+    )
+    const leftGeneral = await bob.eval(
+      `(() => {
+         const el = document.querySelector('button[aria-label^="Direct message Alice"]')
+         if (!el) return false
+         el.click()
+         return true
+       })()`,
+    )
+    check('bob opens his DM with Alice, leaving #general', leftGeneral === true)
+    const awayFromGeneral = await until(
+      async () => {
+        const r = await bob.eval(
+          `(() => {
+             // Message rows only: the quick switcher's own hit rows carry data-conv too.
+             const convs = Array.from(
+               new Set(
+                 Array.from(document.querySelectorAll('[data-conv]:not([data-search-hit])')).map((n) =>
+                   n.getAttribute('data-conv'),
+                 ),
+               ),
+             )
+             const b = document.querySelector('button[aria-label^="Search in "]')
+             return { convs, header: b ? b.getAttribute('aria-label') : null }
+           })()`,
+        )
+        return r && !r.convs.includes(conv) && !!r.header && r.header !== generalHeaderLabel ? r : undefined
+      },
+      10000,
+      250,
+    )
+    check(
+      'the message list really left #general before the jump',
+      !!awayFromGeneral,
+      JSON.stringify(awayFromGeneral ?? { was: generalHeaderLabel ?? null, convs: [conv] }),
+    )
+
+    // The needle goes first so the 44 that follow bury it: alice2 is the live
+    // Alice by now (the original instance was killed for the re-join check).
+    const seedSent = await alice2.eval(
+      `(async () => {
+         let sent = 0
+         try {
+           await window.bridge.chat.send(${JSON.stringify(conv)}, { text: ${JSON.stringify(NEEDLE)}, kind: 'text' })
+           sent++
+           for (let n = 2; n <= ${SEED_TOTAL}; n++) {
+             await window.bridge.chat.send(${JSON.stringify(conv)}, { text: 'filler ' + n, kind: 'text' })
+             sent++
+           }
+         } catch (e) {
+           return { sent, error: String((e && e.message) || e) }
+         }
+         return { sent }
+       })()`,
+    )
+    check(
+      `alice seeds ${SEED_TOTAL} messages into #general, the needle first`,
+      seedSent?.sent === SEED_TOTAL,
+      JSON.stringify(seedSent ?? null),
+    )
+    const seedLanded = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      const texts = (evs ?? []).filter((e) => e.type === 'msg').map((e) => e.payload?.body?.text ?? '')
+      const fillers = texts.filter((t) => /^filler \d+$/.test(t)).length
+      return fillers >= SEED_TOTAL - 1 && texts.includes(NEEDLE) ? { fillers } : undefined
+    }, 120000)
+    check(
+      'bob holds the whole overflow — the needle is 44 messages above the bottom',
+      !!seedLanded,
+      seedLanded ? `${seedLanded.fillers} filler messages behind the needle` : 'the seed never finished arriving',
+    )
+
+    // Everything below measures this one row. The scroller is found from the
+    // row upwards (`closest`), never from the document: a conversation-search
+    // panel is free to virtualize its own results list too.
+    const jumpSel = `[data-jump-target="1"][data-conv=${JSON.stringify(conv)}]`
+    const READ_LANDING = `
+      const measureRow = (row) => {
+        const scroller = row && row.closest('[data-virtuoso-scroller="true"]')
+        if (!row || !scroller) return { found: !!row, scroller: !!scroller, inside: false, bg: '', alpha: 0 }
+        const r = row.getBoundingClientRect()
+        const s = scroller.getBoundingClientRect()
+        const bg = getComputedStyle(row).backgroundColor
+        const m = /rgba?\\(([^)]+)\\)/.exec(bg)
+        const parts = m ? m[1].split(',').map((x) => parseFloat(x)) : []
+        const alpha = m ? (parts.length > 3 ? parts[3] : 1) : bg && bg !== 'transparent' ? 1 : 0
+        return {
+          found: true,
+          scroller: true,
+          inside: r.top >= s.top - ${LANDING_TOLERANCE_PX} && r.bottom <= s.bottom + ${LANDING_TOLERANCE_PX},
+          row: [Math.round(r.top), Math.round(r.bottom)],
+          box: [Math.round(s.top), Math.round(s.bottom)],
+          bg,
+          alpha,
+          text: (row.textContent || '').slice(0, 40),
+        }
+      }
+      // The highlight class comes off a few seconds after the jump, so the
+      // second reading holds on to the element rather than the selector —
+      // otherwise "is it still on screen?" would really be asking "is it still
+      // highlighted?". A row virtuoso has unmounted reads as not found, which
+      // is the right answer: it is not on screen either.
+      const readLanding = () => {
+        const held = window.__jumpRow && window.__jumpRow.isConnected ? window.__jumpRow : null
+        const row = document.querySelector(${JSON.stringify(jumpSel)}) || held
+        if (row) window.__jumpRow = row
+        return measureRow(row)
+      }`
+    const readLanding = (cdp) => cdp.eval(`(() => {${READ_LANDING}\n        return readLanding() })()`)
+    /** Both readings in one eval: where it landed, and where it still is 2 s later. */
+    const holdLanding = (cdp) =>
+      cdp.eval(
+        `(async () => {${READ_LANDING}
+           const before = readLanding()
+           await new Promise((r) => setTimeout(r, 2000))
+           const after = readLanding()
+           return { inside: before.inside, bg: before.bg, alpha: before.alpha, stillInside: after.inside, before, after }
+         })()`,
+      )
+    const landsWithin5s = async (what) => {
+      // Forget the previous landing's row before measuring this one.
+      await bob.eval(`(() => { window.__jumpRow = null; return true })()`)
+      // Landing and highlight are two assertions, not one conjunct: the tint
+      // only lives on the row for JUMP_FLASH_MS (4.8 s), which is *inside* this
+      // poll's own 5 s budget — a landing slow enough to need the last second
+      // would otherwise be reported as a row that never arrived at all. So the
+      // poll waits for arrival, and the tint is read from the first frame the
+      // row is inside. `last` keeps that frame's measurement for the evidence
+      // line, since re-reading after a failure measures a different moment.
+      let last = null
+      const landed = await until(
+        async () => {
+          const m = await readLanding(bob)
+          if (m) last = m
+          return m && m.found && m.inside ? m : undefined
+        },
+        5000,
+        150,
+      )
+      check(
+        `${what}: the row is fully inside the scroller within 5 s`,
+        !!landed,
+        JSON.stringify(landed ?? last ?? null),
+      )
+      check(
+        `${what}: and it is highlighted where it landed`,
+        (landed?.alpha ?? 0) > 0,
+        JSON.stringify(landed ? { bg: landed.bg, alpha: landed.alpha } : (last ?? null)),
+      )
+      const held = await holdLanding(bob)
+      check(
+        `${what}: still fully inside two seconds later — nothing snapped the list back to the bottom`,
+        held?.inside === true && held?.stillInside === true,
+        JSON.stringify(held ?? null),
+      )
+    }
+
+    // Bob's read cursor for #general, and the newest message in it. The sidebar
+    // badge cannot answer this — it is forced to 0 for whichever conversation is
+    // open, which is #general itself the moment the jump lands — so the cursor
+    // is read straight off the bridge, before and after.
+    const READ_CURSOR = `(async () => {
+         const reads = await window.bridge.chat.myReads()
+         const evs = await window.bridge.chat.events(${JSON.stringify(conv)})
+         const newest = (evs || []).reduce((a, e) => (e.type === 'msg' && e.id > a ? e.id : a), '')
+         return { read: (reads && reads[${JSON.stringify(conv)}]) || '', newest }
+       })()`
+    const readBefore = await bob.eval(READ_CURSOR)
+    await typeInSwitcher(bob, 'xyzzy')
+    const needleSearch = await until(async () => {
+      const r = await readSearch(bob)
+      return r && r.hits.some((h) => h.conv === conv) ? r : undefined
+    }, 20000)
+    check(
+      'a word buried 44 messages up is still one ⌘K search away',
+      !!needleSearch,
+      needleSearch ? JSON.stringify(needleSearch.hits.map((h) => h.text)) : 'no Messages section for "xyzzy"',
+    )
+    const needlePressed = await bob.eval(
+      `(() => {
+         const row = document.querySelector('[data-search-hit="1"][data-conv=${JSON.stringify(conv)}]')
+         if (!row) return false
+         row.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+         return true
+       })()`,
+    )
+    check('bob presses that hit from inside another conversation', needlePressed === true)
+    await landsWithin5s('jumping in from another conversation')
+
+    // Landing on a message 44 rows up is not reading the conversation. The list
+    // mounts believing it is at the bottom (that is `atBottom`'s initial state,
+    // and virtuoso's own at-bottom stream is debounced), so before 1.6.1 the
+    // mount-time markRead published a read cursor for the *newest* message the
+    // moment a jump landed near the top — clearing the badge for 44 messages
+    // nobody had seen, and in a DM telling the peer "Read". The suppression is
+    // only observable when this window actually has OS focus (markRead checks
+    // `document.hasFocus()`), so an unattended run passes this trivially; it is
+    // here to catch the regression on a run that does have focus, never to go
+    // red on one that doesn't.
+    const readAfter = await bob.eval(READ_CURSOR)
+    check(
+      'landing on an old message does not mark the whole conversation read',
+      !!readAfter &&
+        !!readBefore &&
+        readAfter.read === readBefore.read &&
+        readAfter.read < readAfter.newest,
+      JSON.stringify({ before: readBefore, after: readAfter }),
+    )
+
+    // (2) Scoped search (1.6.1, stream B's header box) — same landing, but from
+    //     inside the conversation, with the list already mounted at the bottom.
+    const parkedAtBottom = await until(
+      async () => {
+        const r = await bob.eval(
+          `(() => {
+             // The message list's own scroller: reached from the row the last
+             // jump landed on, so a virtualized rail can never be picked here.
+             // Remembered, because scrolling to the bottom unmounts that row.
+             let s = window.__listScroller && window.__listScroller.isConnected ? window.__listScroller : null
+             if (!s) {
+               const held = window.__jumpRow && window.__jumpRow.isConnected ? window.__jumpRow : null
+               s =
+                 (held && held.closest('[data-virtuoso-scroller="true"]')) ||
+                 document.querySelector('[data-virtuoso-scroller="true"]')
+               if (s) window.__listScroller = s
+             }
+             if (s) s.scrollTop = s.scrollHeight
+             return {
+               pills: document.querySelectorAll('button[aria-label^="Jump to "]').length,
+               top: s ? Math.round(s.scrollTop) : -1,
+               // A non-negative scrollTop proves nothing — it clamps to 0 on
+               // any element, scrollable or not. This is the arithmetic that
+               // says the assignment actually reached the end.
+               atBottom: !!s && s.scrollHeight - s.scrollTop - s.clientHeight <= 4,
+             }
+           })()`,
+        )
+        // Both conjuncts have to be real: the pill is the app's own answer
+        // (it counts from the row the landing parked on and only goes away
+        // when virtuoso itself reports at-bottom), the arithmetic is the DOM's.
+        return r && r.atBottom && r.pills === 0 ? r : undefined
+      },
+      15000,
+      400,
+    )
+    check(
+      'bob scrolls #general back to the bottom and the "jump to new messages" pill is gone',
+      !!parkedAtBottom,
+      JSON.stringify(parkedAtBottom ?? null),
+    )
+    // And the needle really left with it. Without this, step (2) could "land"
+    // on a row step (1) had already centred, and the already-mounted scroll
+    // path — the half of the 1.6.0 bug that a remount does not cover — would
+    // never be exercised. A row virtuoso has unmounted reads as `found: false`,
+    // which is the same answer for this purpose: it is not on screen.
+    const leftTarget = await until(
+      async () => {
+        const m = await readLanding(bob)
+        return m && !m.inside ? m : undefined
+      },
+      10000,
+      250,
+    )
+    check(
+      'the needle row is off screen before the scoped search',
+      !!leftTarget,
+      JSON.stringify(leftTarget ?? (await readLanding(bob))),
+    )
+    const headerSearchLabel = await until(async () => {
+      const l = await bob.eval(
+        `(() => { const b = document.querySelector('button[aria-label^="Search in "]'); return b ? b.getAttribute('aria-label') : null })()`,
+      )
+      return l ?? undefined
+    }, 20000)
+    check(
+      'the channel header offers a scoped search',
+      typeof headerSearchLabel === 'string',
+      headerSearchLabel ?? 'no button[aria-label^="Search in "] in the header',
+    )
+    const scopedOpened = await bob.eval(
+      `(() => {
+         const b = document.querySelector('button[aria-label^="Search in "]')
+         if (!b) return false
+         b.click()
+         return true
+       })()`,
+    )
+    check('bob opens the conversation search', scopedOpened === true)
+    const scopedReady = await until(
+      async () => {
+        const r = await bob.eval(
+          `(() => {
+             const tab = document.querySelector('[role="tab"][aria-label="Search tab"][aria-selected="true"]')
+             const input = document.querySelector('input[aria-label^="Search in "]')
+             const active = document.activeElement
+             return {
+               tab: !!tab,
+               input: !!input,
+               focused: !!input && active === input,
+               active: active ? active.getAttribute('aria-label') || active.tagName : 'none',
+             }
+           })()`,
+        )
+        return r && r.tab && r.focused ? r : undefined
+      },
+      10000,
+      250,
+    )
+    check(
+      'the search tab is selected and its box has the focus',
+      !!scopedReady,
+      JSON.stringify(
+        scopedReady ??
+          (await bob.eval(
+            `(() => {
+               const a = document.activeElement
+               return {
+                 tab: !!document.querySelector('[role="tab"][aria-label="Search tab"][aria-selected="true"]'),
+                 input: !!document.querySelector('input[aria-label^="Search in "]'),
+                 active: a ? a.getAttribute('aria-label') || a.tagName : 'none',
+               }
+             })()`,
+          )),
+      ),
+    )
+    const scopedTyped = await bob.eval(
+      `(() => {
+         const i = document.querySelector('input[aria-label^="Search in "]')
+         if (!i) return false
+         i.focus()
+         const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+         set.call(i, 'xyzzy')
+         i.dispatchEvent(new Event('input', { bubbles: true }))
+         return true
+       })()`,
+    )
+    check('bob types "xyzzy" into the conversation search', scopedTyped === true)
+    const scopedHits = await until(async () => {
+      const r = await bob.eval(
+        `Array.from(document.querySelectorAll('[data-conv-search-hit="1"][data-msg-id]')).map((n) => ({
+           id: n.getAttribute('data-msg-id'),
+           text: (n.textContent || '').slice(0, 50),
+         }))`,
+      )
+      return r && r.length > 0 ? r : undefined
+    }, 20000)
+    check(
+      'the conversation search finds the needle in this channel',
+      !!scopedHits && scopedHits.some((h) => /xyzzy/.test(h.text)),
+      JSON.stringify(scopedHits ?? []),
+    )
+    const scopedPressed = await bob.eval(
+      `(() => {
+         const row = document.querySelector('[data-conv-search-hit="1"][data-msg-id]')
+         if (!row) return false
+         row.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+         row.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+         return true
+       })()`,
+    )
+    check('bob presses the scoped hit', scopedPressed === true)
+    await landsWithin5s('jumping from the conversation search')
+
+    // The box is not a channel feature: a DM header carries it too.
+    const dmSearchLabel = await until(
+      async () => {
+        const r = await bob.eval(
+          `(() => {
+             const el = document.querySelector('button[aria-label^="Direct message Alice"]')
+             if (el) el.click()
+             const b = document.querySelector('button[aria-label^="Search in "]')
+             return b ? b.getAttribute('aria-label') : null
+           })()`,
+        )
+        // Its own label, not the channel's still on screen: the header has to
+        // have followed the conversation switch.
+        return r && r !== headerSearchLabel ? r : undefined
+      },
+      15000,
+      500,
+    )
+    check(
+      'a DM header offers the same scoped search, under its own name',
+      typeof dmSearchLabel === 'string',
+      JSON.stringify({ channel: headerSearchLabel ?? null, dm: dmSearchLabel ?? null }),
+    )
+    // Leave bob where the rest of the run expects to find him.
+    await bob.eval(
+      `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+        ` if (!el) return false; el.click(); return true })()`,
+    )
+    // ---- 1.6.1 jump landing + scoped search (end) ----
 
     // Janitor sweep smoke: place an ancient file in blobs and run a manual clean via touch -t
     const oldBlob = join(SHARE, 'Chat', 'blobs', 'aa', 'deadbeef.blob')

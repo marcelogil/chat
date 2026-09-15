@@ -99,7 +99,9 @@ the only thing every machine can reach is an SMB share.
 - **Message search** — the ⌘K/Ctrl-K quick switcher searches inside every
   channel, DM and private group this device can already read, not just
   their names, and jumps straight to the exact message, scrolled into view
-  and briefly highlighted.
+  and briefly highlighted. The magnifier at the top right of every channel,
+  private group and direct message searches just that conversation, listing
+  every match in the side panel instead of the switcher's best few.
 
 ## How messages are secured (even from someone with the passphrase)
 

@@ -17,7 +17,7 @@ import type {
   SysPayload,
   VotPayload,
 } from '@shared/types'
-import { DIR, DST, KID, RETENTION, TEAM_CONV } from '@shared/constants'
+import { BEACON, DIR, DST, KID, RETENTION, TEAM_CONV } from '@shared/constants'
 import { materializeCalendar } from '@shared/calendar'
 import { pollFallbackText } from '@shared/poll'
 import { beaconFileName, dayShard, isChanConv, seqToBase36 } from '@shared/ids'
@@ -298,6 +298,63 @@ describe('two-client integration over a shared folder', () => {
     await bob.events.ingestHeads(conv, heads)
     expect(bob.events.has(conv, sent.id)).toBe(true)
   })
+
+  // 1.6.1. The ring is the only thing a beacon says about a conversation's
+  // recent past, and it holds BEACON.headsRingSize names. Publish more than
+  // that between two of a reader's polls — a paste storm, an import, an E2E
+  // seeding 45 rows — and the oldest simply fall off it: they are never
+  // advertised to anyone, while every name that survives reads back perfectly,
+  // so the missing-head rule sees no gap at all. Before this the reader was
+  // left holding the newest 16 and nothing else until its next blanket sweep,
+  // up to ten minutes away at the idle tier. It ingested no *wrong* history —
+  // it just silently had a hole in the middle of a conversation someone was
+  // looking at.
+  it('a burst larger than the heads ring still arrives in full, from the beacon alone', async () => {
+    const ch = await alice.session.createChannel('burst')
+    const conv: ConvId = `chan:${ch.channelId}`
+    const poller = new Poller(bob.session, bob.events)
+    // Every tick below has the blanket sweep pinned shut: whatever Bob ends up
+    // holding got there through beacon heads and the fallback they trigger.
+    const pinSweep = (): number => ((poller as unknown as { lastSweepAt: number }).lastSweepAt = Date.now())
+    await bob.session.loadChannels()
+    pinSweep()
+    await poller.tick()
+
+    const BURST = BEACON.headsRingSize * 3 - 3 // 45: far past the ring
+    const ids: string[] = []
+    for (let n = 1; n <= BURST; n++) {
+      const stem = await sendMessage(alice, conv, n === 1 ? 'the needle' : `filler ${n}`)
+      ids.push(stem)
+      alice.writer.noteOwnEvent(conv, `${stem}.msg.e1`)
+    }
+    // One beacon for the whole burst — a reader polling every 15 s at the idle
+    // tier sees exactly this and nothing in between.
+    await alice.writer.bump('event')
+    const ring = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)!.content.heads[
+      conv
+    ]
+    expect(ring).toHaveLength(BEACON.headsRingSize)
+    // The premise: the ring is full of names that all read back fine, and the
+    // oldest message of the burst — the one being searched for — is not in it.
+    expect(ring).not.toContain(`${ids[0]}.msg.e1`)
+
+    pinSweep()
+    await poller.tick()
+    expect(ids.filter((id) => bob.events.has(conv, id))).toHaveLength(BURST)
+    expect(textsIn(bob, conv)).toContain('the needle')
+
+    // And the fallback is one-shot, not a per-poll tax: now that Bob recognizes
+    // the ring, the next message rides the cheap path with no day scan at all.
+    const catchUp = vi.spyOn(bob.events, 'catchUp')
+    const after = await sendMessage(alice, conv, 'one more')
+    alice.writer.noteOwnEvent(conv, `${after}.msg.e1`)
+    await alice.writer.bump('event')
+    pinSweep()
+    await poller.tick()
+    expect(catchUp).not.toHaveBeenCalled()
+    catchUp.mockRestore()
+    expect(bob.events.has(conv, after)).toBe(true)
+  }, 120_000)
 
   it('calendar entry round-trips A → B and lives under team/, not channels/', async () => {
     const conv = TEAM_CONV.calendar
