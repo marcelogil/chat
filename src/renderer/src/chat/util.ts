@@ -292,6 +292,9 @@ export function sysLine(sys: SysView, nameOf: (device: string) => string): strin
       return `${author} opened a live board${str('title') ? `: ${str('title')}` : ''}`
     case 'board-ended':
       return `${author} ended the live board${str('title') ? ` ${str('title')}` : ''}`
+    // 1.5 — team settings
+    case 'team-renamed':
+      return `${author} renamed the team${str('name') ? ` to ${str('name')}` : ''}`
     case 'group-removed':
       return `You were removed from 🔒 ${str('name') ?? 'a private group'}`
     default:

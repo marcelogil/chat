@@ -228,6 +228,8 @@ export interface SysPayload {
     // Live boards (1.3): a real-time diagram session over boards/<sessionId>/.
     | 'board-live' // data: { sessionId, boardId, title, host, startedAt }
     | 'board-ended' // data: { sessionId, boardId, resultStem? } — host only
+    // Team settings (1.5), in TEAM_CONV.settings: any verified member, LWW by event id.
+    | 'team-renamed' // data: { name }
   data: Record<string, unknown>
 }
 

@@ -166,6 +166,10 @@ const bridge: BridgeApi = {
     copyToMachine: () => invoke('update:copyToMachine'),
   },
 
+  team: {
+    rename: (name) => invoke('team:rename', name),
+  },
+
   diag: {
     shareStats: () => invoke('diag:shareStats'),
   },

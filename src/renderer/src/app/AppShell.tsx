@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { TEAM_CONV } from '@shared/constants'
 import { isDmConv, isGrpConv, isTeamConv } from '@shared/ids'
 import { useStore } from '@/store'
 import ChatPane from '@/chat/ChatPane'
 import { CalendarPane } from '@/team/CalendarPane'
+import { CalendarDigest } from '@/team/CalendarDigest'
 import { PrsPane } from '@/team/PrsPane'
 import { PrAlert } from '@/team/PrAlert'
 import { Lightbox } from '@/content/Lightbox'
@@ -14,6 +14,7 @@ import ChannelHeader from './ChannelHeader'
 import RightRail from './RightRail'
 import type { RailTab } from './RightRail'
 import SettingsModal from './SettingsModal'
+import { teamPaneFor } from './teamPane'
 import { HealthBanner } from './banners'
 import { Toasts } from './toasts'
 import { NoConvState, EmptyConvOverlay } from './EmptyStates'
@@ -21,6 +22,7 @@ import { ActiveShareBanner, ScreenShareRoot } from '@/screenshare/ShareUi'
 import { BeamSurface } from './BeamSurface'
 import { UpdateBanner } from './UpdateBanner'
 import { LaunchNudge } from './LaunchNudge'
+import { EasterEggOverlay } from './EasterEggOverlay'
 
 // The main three-pane application shell (spec §2). A slim drag strip spans the
 // top (empty, so macOS traffic lights sit alone); the team block lives at the
@@ -127,7 +129,11 @@ export default function AppShell() {
           {convKind === 'team' ? (
             <>
               <HealthBanner />
-              {activeConv === TEAM_CONV.calendar ? <CalendarPane /> : <PrsPane />}
+              {teamPaneFor(activeConv) === 'calendar' ? (
+                <CalendarPane />
+              ) : teamPaneFor(activeConv) === 'prs' ? (
+                <PrsPane />
+              ) : null}
             </>
           ) : activeConv ? (
             <>
@@ -167,11 +173,15 @@ export default function AppShell() {
         )}
       </div>
 
+      {/* 1.5 — the message easter eggs. Fixed, pointer-events: none, z 50:
+          over the conversation, under everything anyone opened on purpose. */}
+      <EasterEggOverlay />
       <Toasts />
       <Lightbox />
       <DiagramRoot />
       <ScreenShareRoot />
       <BeamSurface />
+      <CalendarDigest />
       <PrAlert />
       <UpdateBanner />
       <LaunchNudge />

@@ -20,6 +20,8 @@ import { toast } from '@/app/toasts'
 import type { DiagramEditorState } from '@/diagram/state'
 import { endBoardIn, foldBoardEvents, type LiveBoardMap } from '@/diagram/live'
 import { findGroupRemovedEvent, resolveActiveConvVanish } from './convVanish'
+import { noteLiveEvent, resetLiveEvents } from './liveEvents'
+import { teamRenameNotice } from './teamRename'
 
 // Central renderer state. Raw events per conversation live here; components
 // materialize views with @shared/merge (memoized). All mutations go through
@@ -35,7 +37,19 @@ export interface TypingMap {
  * notifications popover ("All notification settings…") and the launch nudge —
  * and only the last of those can reach the component's own state (1.4).
  */
-export type SettingsSection = 'profile' | 'appearance' | 'notifications' | 'privacy' | 'quickMessages' | 'storage' | 'about'
+export type SettingsSection =
+  | 'profile'
+  // 1.5 — the admin panel: the team name (team-wide) and the always-online
+  // toggle (personal). Listed in the nav only for an admin — `isGil`,
+  // @shared/gilMode — and the rename it offers is refused on the share side
+  // for anybody else (main/services/teamSettings.ts).
+  | 'admin'
+  | 'appearance'
+  | 'notifications'
+  | 'privacy'
+  | 'quickMessages'
+  | 'storage'
+  | 'about'
 
 interface ChatStore {
   boot: BootMode | null
@@ -268,6 +282,8 @@ export const useStore = create<ChatStore>((set, get) => ({
             // this same render unmounts AppShell (and PrAlert with it), so an
             // effect keyed on the unseen count never gets to write the 0.
             void window.bridge.app.setBadge(0).catch(() => {})
+            // Event ids belong to the team that just went away.
+            resetLiveEvents()
             set({
               teamSeq: s.teamSeq + 1,
               channels: [],
@@ -295,13 +311,44 @@ export const useStore = create<ChatStore>((set, get) => ({
           }
           break
         case 'event': {
+          // This is the only place where "this event is new to me" is still
+          // knowable: every log is prefetched at boot, so by the time a pane
+          // opens its contents say nothing about when they arrived. The easter
+          // eggs (1.5) ask this afterwards; see store/liveEvents.ts.
+          noteLiveEvent(msg.event.id)
           const liveBoards = foldBoardEvents(s.liveBoards, [msg.event])
           set({
             events: { ...s.events, [msg.conv]: insertEvent(s.events[msg.conv] ?? [], msg.event) },
             ...(liveBoards === s.liveBoards ? {} : { liveBoards }),
           })
+          // 1.5 — "Ana renamed the team to X". The `team` push below carries
+          // the new name but not who set it (PushMessage shapes are frozen),
+          // and the renamer must not be told about their own rename, so the
+          // notice is built from the event itself.
+          //
+          // Only once this log has been pulled, though: main replays every
+          // team event through this push as it catches the log up at session
+          // start — and on macOS every launch goes through the unlock screen,
+          // i.e. through a session start with this window already listening.
+          // A rename from last month is not news.
+          const notice = s.eventsLoaded[msg.conv]
+            ? teamRenameNotice({
+                conv: msg.conv,
+                event: msg.event,
+                selfDeviceId: s.boot?.mode === 'ready' ? s.boot.self.deviceId : '',
+                nameOf: (d) => s.presence.find((p) => p.deviceId === d)?.name ?? d.slice(0, 8),
+              })
+            : null
+          if (notice) toast(notice, 'info')
           break
         }
+        // 1.5 — the folded team name changed (main is the authority on which
+        // `team-renamed` won). SelfView is where every surface reads it from.
+        case 'team':
+          if (s.boot?.mode === 'ready') {
+            set({ boot: { mode: 'ready', self: { ...s.boot.self, teamName: msg.teamName } } })
+          }
+          break
         // Live boards (1.3): frames go straight to the open editor (see
         // onBoardPush); only the end of a session is state anybody else cares
         // about.

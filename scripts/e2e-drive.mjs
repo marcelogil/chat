@@ -364,13 +364,23 @@ async function main() {
   const appSupport = join(homedir(), 'Library', 'Application Support')
   // alice2 is the re-join profile: a third instance, same machine, same
   // display name, brand-new local data — what "Reset local data" leaves behind.
+  // carol is a genuinely fresh device (new name, never opened before) used
+  // only to observe the daily calendar toast's boot trigger, which alice's and
+  // bob's own instances can no longer demonstrate once they are mid-run.
+  // gil is another short-lived one: the team rename is admin-only (1.5), and
+  // "admin" is a display name — so the only way to drive a real rename is an
+  // instance that joined the team calling itself Gil.
   for (const p of [
     'Chat-e2e-alice',
     'Chat-e2e-alice2',
     'Chat-e2e-bob',
+    'Chat-e2e-carol',
+    'Chat-e2e-gil',
     'semaphore-e2e-alice',
     'semaphore-e2e-alice2',
     'semaphore-e2e-bob',
+    'semaphore-e2e-carol',
+    'semaphore-e2e-gil',
   ]) {
     rmSync(join(appSupport, p), { recursive: true, force: true })
   }
@@ -393,10 +403,16 @@ async function main() {
   const procB = launch('bob', 9334)
   /** Alice again, after a reset — started near the end of the run (1.4). */
   let procC = null
+  /** Carol: a fresh device joined mid-run, for the daily calendar toast (1.5). */
+  let procD = null
+  /** Gil: the admin, joined just long enough to rename the team (1.5). */
+  let procE = null
   const kill = () => {
     try { procA.kill() } catch {}
     try { procB.kill() } catch {}
     try { procC?.kill() } catch {}
+    try { procD?.kill() } catch {}
+    try { procE?.kill() } catch {}
     try { ado.server.closeAllConnections?.() } catch {}
     try { ado.server.close() } catch {}
   }
@@ -686,6 +702,193 @@ async function main() {
       helloErr || 'resolved instead of rejecting',
     )
 
+    // ---- Team rename (1.5): only the admin renames the team ----------------
+    // The name lives in a signed `team-renamed` sys event in team:settings,
+    // folded LWW — protocol.json is never rewritten, so a client that folds
+    // nothing still shows the original name (and 1.4 clients never look).
+    //
+    // Renaming is admin-only, and "admin" is a display name (TEAM_ADMIN_NAMES):
+    // alice is refused here, and the rename that follows is driven by a fourth
+    // instance that joined the team calling itself Gil.
+    const aliceRenameRes = await alice.eval(
+      `window.bridge.team.rename('Alice Crew').then((r) => JSON.stringify(r), (x) => String((x && x.message) || x))`,
+    )
+    check(
+      "alice's team.rename is refused — she is not an admin",
+      /not-admin/.test(aliceRenameRes ?? ''),
+      aliceRenameRes || 'resolved instead of rejecting',
+    )
+    const aliceStillOldName = await alice.eval(`window.bridge.app.getBoot()`)
+    check(
+      'the refused rename changed nothing',
+      aliceStillOldName?.mode === 'ready' && aliceStillOldName.self.teamName === 'E2E Team',
+      aliceStillOldName?.self?.teamName ?? 'not ready',
+    )
+
+    procE = launch('gil', 9337)
+    try {
+      const gil = await connect(9337, 30000)
+      const subGil = await gil.eval(
+        `window.bridge.onboarding.submit({ sharePath: ${JSON.stringify(SHARE)}, passphrase: ${JSON.stringify(PASS)}, displayName: 'Gil', teamName: '' })`,
+      )
+      check('gil (the admin) joins the team on a fresh profile', subGil?.ok === true, subGil?.error ?? '')
+      const gilReady = await until(async () => {
+        const boot = await gil.eval(`window.bridge.app.getBoot()`)
+        return boot?.mode === 'ready' ? boot : undefined
+      }, 20000)
+      check('gil reaches ready', !!gilReady, gilReady ? gilReady.self?.fingerprint : 'timed out')
+
+      const teamRenameRes = await gil.eval(
+        `window.bridge.team.rename('  Ops   Crew ').then((r) => r, (x) => String((x && x.message) || x))`,
+      )
+      check(
+        'gil renames the team via team.rename',
+        !!teamRenameRes && teamRenameRes.queued === false,
+        JSON.stringify(teamRenameRes ?? null),
+      )
+      const shortTeamName = await gil.eval(
+        `window.bridge.team.rename('   ').then(() => '', (x) => String((x && x.message) || x))`,
+      )
+      check('an empty team name is refused', /invalid-name/.test(shortTeamName), shortTeamName || 'resolved')
+      const longTeamName = await gil.eval(
+        `window.bridge.team.rename('x'.repeat(41)).then(() => '', (x) => String((x && x.message) || x))`,
+      )
+      check('a 41-character team name is refused', /invalid-name/.test(longTeamName), longTeamName || 'resolved')
+
+      // The renamer sees it at once and is not told about their own rename.
+      const gilTeamName = await until(async () => {
+        const b = await gil.eval(`window.bridge.app.getBoot()`)
+        return b?.mode === 'ready' && b.self.teamName === 'Ops Crew' ? b.self.teamName : undefined
+      }, 15000)
+      check(
+        "gil's getBoot().self.teamName is the normalized name",
+        gilTeamName === 'Ops Crew',
+        gilTeamName ?? 'never folded',
+      )
+      const gilToasts = await gil.eval(
+        `Array.from(document.querySelectorAll('button[aria-label^="Dismiss notification:"]')).map((n) => n.getAttribute('aria-label'))`,
+      )
+      check(
+        'the renamer is not toasted about their own rename',
+        !(gilToasts ?? []).some((l) => l && l.includes('renamed the team')),
+        JSON.stringify(gilToasts ?? []),
+      )
+
+      // Renaming it to the name it already has writes nothing: `{ queued: false }`
+      // means "nothing is waiting", not "an event was written", so the team log
+      // still holds exactly the one rename (Settings tells the two apart by the
+      // name it had before the call, and never toasts "Team renamed" for a no-op).
+      const teamNoopRes = await gil.eval(
+        `window.bridge.team.rename('Ops Crew').then((r) => r, (x) => String((x && x.message) || x))`,
+      )
+      check(
+        'renaming the team to the same name resolves without queueing',
+        !!teamNoopRes && teamNoopRes.queued === false,
+        JSON.stringify(teamNoopRes ?? null),
+      )
+
+      // Everyone else hears about it on the next poll: a toast that names him,
+      // and the same folded name in their own SelfView. Alice is an ordinary
+      // member here — she is told about somebody else's rename like anyone.
+      const aliceTeamName = await until(async () => {
+        const b = await alice.eval(`window.bridge.app.getBoot()`)
+        return b?.mode === 'ready' && b.self.teamName === 'Ops Crew' ? b.self.teamName : undefined
+      }, 30000)
+      check(
+        "alice's getBoot().self.teamName folds the admin's rename",
+        aliceTeamName === 'Ops Crew',
+        aliceTeamName ?? 'never folded',
+      )
+      const aliceSidebarTeam = await until(async () => {
+        const ok = await alice.eval(`!!document.querySelector('[title="Ops Crew"]')`)
+        return ok === true ? true : undefined
+      }, 15000)
+      check("alice's sidebar header shows the new team name", aliceSidebarTeam === true)
+      const aliceTeamToast = await until(async () => {
+        const labels = await alice.eval(
+          `Array.from(document.querySelectorAll('button[aria-label^="Dismiss notification:"]')).map((n) => n.getAttribute('aria-label'))`,
+        )
+        return labels?.find((l) => l && l.includes('renamed the team to Ops Crew'))
+      }, 30000)
+      check(
+        'alice is toasted "<name> renamed the team to Ops Crew"',
+        !!aliceTeamToast,
+        aliceTeamToast ?? 'no such toast',
+      )
+      const bobTeamToast = await until(async () => {
+        const labels = await bob.eval(
+          `Array.from(document.querySelectorAll('button[aria-label^="Dismiss notification:"]')).map((n) => n.getAttribute('aria-label'))`,
+        )
+        return labels?.find((l) => l && l.includes('renamed the team to Ops Crew'))
+      }, 30000)
+      check('bob is toasted "<name> renamed the team to Ops Crew"', !!bobTeamToast, bobTeamToast ?? 'no such toast')
+      const bobTeamName = await until(async () => {
+        const b = await bob.eval(`window.bridge.app.getBoot()`)
+        return b?.mode === 'ready' && b.self.teamName === 'Ops Crew' ? b.self.teamName : undefined
+      }, 30000)
+      check(
+        "bob's getBoot().self.teamName folds the rename too",
+        bobTeamName === 'Ops Crew',
+        bobTeamName ?? 'timed out',
+      )
+      const teamSettingsEvents = await alice.eval(`window.bridge.chat.events('team:settings')`)
+      check(
+        'the no-op rename published no second event',
+        Array.isArray(teamSettingsEvents) && teamSettingsEvents.length === 1,
+        `${Array.isArray(teamSettingsEvents) ? teamSettingsEvents.length : 'n/a'} events`,
+      )
+    } finally {
+      try { procE.kill() } catch {}
+      procE = null
+    }
+
+    // ---- Renaming a channel from the conversation header (1.5) -------------
+    // #greetings-all is open on alice and is not the home channel, so the
+    // header name is a button that turns into the sidebar's inline rename.
+    // The pencil revealed on hover lives *inside* that button, so clicking the
+    // affordance is the same click as clicking the name — it used to be an
+    // aria-hidden sibling with no handler, i.e. an icon that did nothing.
+    const headerPencilInButton = await until(async () => {
+      const ok = await alice.eval(
+        `!!document.querySelector('button[aria-label="Rename #greetings-all"] svg')`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('the header rename pencil is inside the button, not a dead icon', headerPencilInButton === true)
+    const headerRenameOpened = await until(async () => {
+      const ok = await alice.eval(
+        `(() => { const el = document.querySelector('button[aria-label="Rename #greetings-all"]');` +
+          ` if (!el) return false; el.click(); return true })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('alice clicks the channel name in the header', headerRenameOpened === true)
+    const headerRenameTyped = await until(async () => {
+      const ok = await alice.eval(
+        `(() => {
+           const i = document.querySelector('input[aria-label="Rename #greetings-all"]')
+           if (!i) return false
+           i.focus()
+           const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+           set.call(i, 'Greetings Team')
+           i.dispatchEvent(new Event('input', { bubbles: true }))
+           i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+           return true
+         })()`,
+      )
+      return ok === true ? true : undefined
+    }, 20000)
+    check('alice types a new name in the header and presses Enter', headerRenameTyped === true)
+    const bobHeaderRename = await until(async () => {
+      const chs = await bob.eval(`window.bridge.chat.channels()`)
+      return chs?.find((c) => c.conv === helloCh?.conv && c.name === 'greetings-team')
+    }, 30000)
+    check(
+      'bob sees the header rename, normalized like the sidebar one',
+      !!bobHeaderRename,
+      bobHeaderRename ? bobHeaderRename.name : 'never arrived',
+    )
+
     // ---- Private groups: create, DM-borne invite, message, rename (1.2) ----
     const group = await alice.eval(
       `window.bridge.groups.create('Duo', [${JSON.stringify(selfB.self.deviceId)}])`,
@@ -826,6 +1029,205 @@ async function main() {
       'Option/Alt-click (insert instead of send) is not covered — not drivable without a real modifier-key click, and there is no bridge hook to verify it independently',
       true,
     )
+
+    // ---- Message easter eggs (1.5): a bug runs, confetti falls -------------
+    // The animation is a DOM layer that removes itself after ~3 s, so polling
+    // for it directly is a race the script would sometimes lose. Install a
+    // recorder in each page instead and read what it caught. It also captures
+    // the computed pointer-events, which is the part of the feature that must
+    // never regress: a layer over the whole window that swallowed clicks would
+    // make the app look frozen for three seconds.
+    const eggRecorder = `(() => {
+      if (window.__eggTimer) clearInterval(window.__eggTimer)
+      window.__eggs = []
+      window.__eggLast = null
+      window.__eggTimer = setInterval(() => {
+        const el = document.querySelector('[data-easter-egg]')
+        const cur = el ? el.getAttribute('data-easter-egg') : null
+        if (cur && cur !== window.__eggLast) {
+          window.__eggs.push({ egg: cur, pe: getComputedStyle(el).pointerEvents, z: getComputedStyle(el).zIndex })
+        }
+        window.__eggLast = cur
+      }, 100)
+      return { reduced: matchMedia('(prefers-reduced-motion: reduce)').matches }
+    })()`
+    const eggEnvB = await bob.eval(eggRecorder)
+    await alice.eval(eggRecorder)
+    // Reduced motion switches the whole feature off by design, so on a machine
+    // configured that way these prove nothing and must not fail the run.
+    const eggCheck = eggEnvB?.reduced ? soft : check
+    soft('bob has reduced motion off (the eggs are deliberately silent when it is on)', eggEnvB?.reduced === false)
+
+    // Both windows on #general, so the rows actually come on screen — the
+    // trigger is "the reader can see it", not "the event arrived".
+    for (const [who, cdp] of [['alice', alice], ['bob', bob]]) {
+      const opened = await until(async () => {
+        const ok = await cdp.eval(
+          `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+            ` if (!el) return false; el.click(); return true })()`,
+        )
+        return ok === true ? true : undefined
+      }, 20000)
+      check(`${who} has #general open for the easter eggs`, opened === true)
+    }
+
+    // The negative goes first, while nothing has played: at this point an
+    // animation cannot be hidden by the 8 s throttle, so silence means the
+    // detector really did refuse "debugging".
+    await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, { text: 'debugging all morning, no luck', kind: 'text' })`,
+    )
+    const gotDebug = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.payload?.body?.text?.startsWith('debugging all morning'))
+    }, 20000)
+    check('bob receives the "debugging" message', !!gotDebug)
+    await sleep(2500) // it is on screen by now if it were ever going to play
+    const afterDebug = await bob.eval(`window.__eggs`)
+    check(
+      'a message containing "debugging" plays nothing',
+      Array.isArray(afterDebug) && afterDebug.length === 0,
+      JSON.stringify(afterDebug ?? null),
+    )
+
+    // Wait for the *message*, then for the animation — never for both at once.
+    // By this point in an unattended run nobody has touched the keyboard for
+    // three minutes, so every instance has dropped to the idle I/O tier
+    // (POLL.idleMs = 15 s) and a send can sit a full tick before it surfaces:
+    // measured here at 5–15 s, against the 3 s these two windows see while
+    // they are still on the background tier. A budget that starts at the send
+    // is therefore timing the share's cadence, not the egg, and fails the run
+    // on a message that had simply not arrived yet. The negative check above
+    // already works this way, which is exactly why it never flaked.
+    const bugMsg = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, { text: 'we found a bug in prod', kind: 'text' })`,
+    )
+    const gotBug = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.id === bugMsg?.id)
+    }, 30000)
+    check('bob receives the "bug" message', !!gotBug, gotBug ? '' : 'never arrived')
+    const bugSeen = await until(async () => {
+      const eggs = await bob.eval(`window.__eggs`)
+      return eggs?.find((e) => e.egg === 'bug')
+    }, 10000, 200)
+    eggCheck(
+      'bob sees the bug overlay within 10 s of the message landing',
+      !!bugSeen,
+      bugSeen ? `pointer-events=${bugSeen.pe} z=${bugSeen.z}` : 'no [data-easter-egg="bug"] ever appeared',
+    )
+    check(
+      'the overlay never intercepts the mouse',
+      !bugSeen || bugSeen.pe === 'none',
+      bugSeen ? `pointer-events=${bugSeen.pe}` : 'not reached',
+    )
+    const bugOnSender = await until(async () => {
+      const eggs = await alice.eval(`window.__eggs`)
+      return eggs?.find((e) => e.egg === 'bug')
+    }, 6000, 300)
+    eggCheck('alice, who sent it, sees her own bug run past', !!bugOnSender)
+
+    // One animation every 8 s: the next one has to wait, or it collapses on
+    // purpose and this check would be testing the throttle instead. The gap is
+    // counted from the moment the bug actually *ran* (the poll above returns
+    // within 200 ms of it), not from the moment it was sent — on the idle tier
+    // those are up to 15 s apart, and counting from the send is how a
+    // legitimate confetti gets collapsed and reported as a failure.
+    await sleep(9000)
+    const confMsg = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, { text: 'Parabéns!', kind: 'text' })`,
+    )
+    const gotConf = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.id === confMsg?.id)
+    }, 30000)
+    check('bob receives the "Parabéns!" message', !!gotConf, gotConf ? '' : 'never arrived')
+    const confettiSeen = await until(async () => {
+      const eggs = await bob.eval(`window.__eggs`)
+      return eggs?.find((e) => e.egg === 'confetti')
+    }, 10000, 200)
+    eggCheck(
+      'bob sees confetti for "Parabéns!" (accent-folded Portuguese)',
+      !!confettiSeen,
+      confettiSeen ? '' : `recorded: ${JSON.stringify(await bob.eval(`window.__eggs`))}`,
+    )
+    // The other half of the trigger rule, and the one that carries every
+    // reader who is *not* already staring at the pane: a message that arrived
+    // while Bob was somewhere else, in a conversation he has never read, has
+    // to play when he finally walks into it. It regressed once, silently —
+    // both checks above pass with Bob sitting in #general the whole time.
+    //
+    // Bob opens the channel while it is still empty, which leaves him with no
+    // read mark at all (there is no newest message to mark), then leaves.
+    const eggCh = await alice.eval(`window.bridge.chat.createChannel('eggroom')`)
+    check('alice creates #eggroom for the unread-at-open egg', !!eggCh?.conv, eggCh ? eggCh.conv : 'no conv')
+    // Nothing advertises a channel nobody has written into; one sys event puts
+    // its conv id on Alice's beacon heads (the #greetings trick above).
+    await alice.eval(`window.bridge.chat.renameChannel(${JSON.stringify(eggCh?.conv)}, 'eggroom-live')`)
+    const bobSeesEggCh = await until(async () => {
+      const chs = await bob.eval(`window.bridge.chat.channels()`)
+      return chs?.find((c) => c.conv === eggCh?.conv)
+    }, 60000)
+    check("bob's sidebar picks up #eggroom-live", !!bobSeesEggCh, bobSeesEggCh ? bobSeesEggCh.name : 'never appeared')
+    const eggRowClick = (cdp) =>
+      cdp.eval(
+        `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel eggroom"]');` +
+          ` if (!el) return false; el.click(); return true })()`,
+      )
+    const openedEmpty = await until(async () => ((await eggRowClick(bob)) === true ? true : undefined), 20000)
+    check('bob opens #eggroom-live while it is still empty', openedEmpty === true)
+    await sleep(1000)
+    await bob.eval(
+      `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+        ` if (!el) return false; el.click(); return true })()`,
+    )
+    await sleep(9000) // clear of the 8 s throttle the confetti above just armed
+    await bob.eval(`(() => { window.__eggs = []; window.__eggLast = null; return true })()`)
+    await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(eggCh?.conv)}, { text: 'Herzlichen Glückwunsch!', kind: 'text' })`,
+    )
+    const landedAway = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(eggCh?.conv)})`)
+      return evs?.find((e) => e.type === 'msg' && (e.payload?.body?.text || '').startsWith('Herzlichen'))
+    }, 30000)
+    check('the message reaches bob while he is looking at another channel', !!landedAway)
+    const quietWhileAway = await bob.eval(`window.__eggs`)
+    check(
+      'nothing plays for a conversation bob is not looking at',
+      Array.isArray(quietWhileAway) && quietWhileAway.length === 0,
+      JSON.stringify(quietWhileAway ?? null),
+    )
+    const openedAgain = await until(async () => ((await eggRowClick(bob)) === true ? true : undefined), 20000)
+    check('bob walks into #eggroom-live, where he has never read a thing', openedAgain === true)
+    const unreadEgg = await until(async () => {
+      const eggs = await bob.eval(`window.__eggs`)
+      return eggs?.find((e) => e.egg === 'confetti')
+    }, 10000, 300)
+    eggCheck(
+      'the egg waits for him: confetti plays when he opens the never-read channel',
+      !!unreadEgg,
+      unreadEgg ? '' : `recorded: ${JSON.stringify(await bob.eval(`window.__eggs`))}`,
+    )
+
+    await bob.eval(`(() => { clearInterval(window.__eggTimer); window.__eggTimer = null; return true })()`)
+    await alice.eval(`(() => { clearInterval(window.__eggTimer); window.__eggTimer = null; return true })()`)
+
+    // Park both windows back on #general. This block leaves Bob standing in
+    // #eggroom-live, and everything after it that reads the *pane* rather than
+    // the log — the two diagram tiles, the Collaborate button — looks for its
+    // subject in whatever conversation happens to be open, and reported "no
+    // tile" for the rest of the run. Same handle as everywhere else: the real
+    // sidebar row, clicked.
+    for (const [who, cdp] of [['alice', alice], ['bob', bob]]) {
+      const back = await until(async () => {
+        const ok = await cdp.eval(
+          `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+            ` if (!el) return false; el.click(); return true })()`,
+        )
+        return ok === true ? true : undefined
+      }, 20000)
+      check(`${who} is back on #general after the easter eggs`, back === true)
+    }
 
     // ---- Poll with a quick decision (1.3): vote, close, both directions ----
     // The whole point of the `vot` event type is that it travels on its own
@@ -1707,6 +2109,18 @@ async function main() {
         annual: true,
         notes: '',
       },
+      {
+        id: 'a1b2c3d4e5f60003',
+        // Dated today, on purpose (1.5): this is what the daily calendar toast
+        // below reads. Dana's birthday above is +5 days, so it never competes.
+        title: "Gil's birthday",
+        tag: 'Birthday',
+        color: 1,
+        start: ymd(today),
+        end: ymd(today),
+        annual: false,
+        notes: '',
+      },
     ]
     let calPut = true
     for (const e of entries) {
@@ -1716,7 +2130,7 @@ async function main() {
       if (err) calPut = false
       if (err) console.log(`    calendar.put(${e.id}) rejected: ${err}`)
     }
-    check('alice publishes two calendar entries', calPut)
+    check('alice publishes three calendar entries', calPut)
 
     const calB = await until(async () => {
       const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(CAL)})`)
@@ -1724,7 +2138,7 @@ async function main() {
       return entries.every((x) => puts.some((p) => p.payload?.entry?.id === x.id)) ? puts : undefined
     }, 25000)
     check(
-      'bob receives both calendar entries (verified, under team/)',
+      'bob receives all three calendar entries (verified, under team/)',
       !!calB,
       calB ? calB.map((p) => p.payload.entry.title).join(' · ') : 'timed out',
     )
@@ -1745,6 +2159,49 @@ async function main() {
       )
     }, 25000)
     check("alice sees bob's calendar tombstone", !!tomb, tomb ? `by ${tomb.author?.slice(0, 8)}` : 'timed out')
+
+    // ---- Daily calendar toast (1.5) ----------------------------------------
+    // alice's and bob's own instances already ran their once-per-day boot
+    // check long before "Gil's birthday" existed, and re-showing mid-day is
+    // by design not a thing (CalendarDigest.tsx) — so the only way to observe
+    // the boot trigger against real data is a device that has never booted
+    // before. Carol joins now, purely for this: a fresh profile, a fresh
+    // localStorage, reaching ready after the birthday entry is already on the
+    // share.
+    procD = launch('carol', 9336)
+    try {
+      const carol = await connect(9336, 30000)
+      const subCarol = await carol.eval(
+        `window.bridge.onboarding.submit({ sharePath: ${JSON.stringify(SHARE)}, passphrase: ${JSON.stringify(PASS)}, displayName: 'Carol', teamName: '' })`,
+      )
+      check('carol (fresh profile) joins the team', subCarol?.ok === true, subCarol?.error ?? '')
+
+      const carolReady = await until(async () => {
+        const boot = await carol.eval(`window.bridge.app.getBoot()`)
+        return boot?.mode === 'ready' ? boot : undefined
+      }, 20000)
+      check('carol reaches ready', !!carolReady, carolReady ? carolReady.self?.fingerprint : 'timed out')
+
+      // The 20s budget starts here, at ready — not at the onboarding submit
+      // above (join + first-sync time does not count against the toast).
+      // Toasts render as `button[aria-label^="Dismiss notification:"]` — see
+      // app/toasts.tsx — so the label text is read directly rather than
+      // scraping visible text from every "frosted" popover-shaped element.
+      const digestToast = await until(async () => {
+        const labels = await carol.eval(
+          `Array.from(document.querySelectorAll('button[aria-label^="Dismiss notification:"]')).map((n) => n.getAttribute('aria-label') || '')`,
+        )
+        return labels?.find((t) => /birthday/i.test(t))
+      }, 20000)
+      check(
+        "carol (fresh profile) sees a calendar digest toast mentioning 'birthday' within 20s of ready",
+        !!digestToast,
+        digestToast ?? 'no matching toast within the window',
+      )
+    } finally {
+      try { procD.kill() } catch {}
+      procD = null
+    }
 
     // ---- Pull-request group over a fake Azure DevOps -----------------------
     const anon = await fetch(`${ado.baseUrl}/_apis/connectionData?api-version=6.0-preview`).catch(() => null)
@@ -1954,6 +2411,150 @@ async function main() {
       'every Azure DevOps call carried the Basic token',
       ado.state.requests > 0 && ado.state.rejected === 1,
       `${ado.state.requests} requests, ${ado.state.rejected} rejected (the deliberate anonymous one)`,
+    )
+
+    // 1.5 — the header's "N overdue" count toggle. No push, no threads, a
+    // reviewer sitting at 0: needs-review, waiting on reviewers since creation
+    // — and creation is 4 days ago, well past the 48h review SLA but nowhere
+    // near the 14-day stale mark, so this PR is overdue and nothing else is.
+    ado.state.prs['repo-api'].push(
+      adoPr({
+        id: 4301,
+        repo: ADO_REPOS[1],
+        title: 'Ancient: rename the retry queue',
+        author: DANA,
+        source: 'dana/rename-retry-queue',
+        target: 'release/24.9',
+        reviewers: [{ ...ME_REVIEWER, vote: 0, isRequired: true }],
+        ageH: 96,
+      }),
+    )
+    const overdueSeen = await until(async () => {
+      await bob.eval(`window.bridge.prs.refresh()`).catch(() => {})
+      const l = await bob.eval(`window.bridge.prs.list()`)
+      const p = l?.find((x) => x.id === 4301)
+      return p?.state?.overdue === true ? p : undefined
+    }, 30000)
+    check(
+      'bob computes the new pull request as overdue (needs-review, past the 48h SLA)',
+      overdueSeen?.state?.kind === 'needs-review' && overdueSeen?.state?.overdue === true,
+      overdueSeen?.state ? `${overdueSeen.state.kind} overdue=${overdueSeen.state.overdue}` : 'timed out',
+    )
+
+    // The pane has to actually be open for its header buttons to exist in the DOM.
+    await paneShot(bob, 'Pull requests', join(SHOTS, 'e2e-prs-overdue.png'))
+    const overdueRowSel = '[aria-label^="Pull request 4301,"]'
+    const overdueRowShown = await until(
+      async () => ((await bob.eval(`!!document.querySelector(${JSON.stringify(overdueRowSel)})`)) === true ? true : undefined),
+      10000,
+      300,
+    )
+    check('the row for #4301 renders in the pane', !!overdueRowShown, overdueRowShown ? '' : 'timed out')
+
+    const findOverdueBtn =
+      `Array.from(document.querySelectorAll('button[aria-pressed]')).find((b) => /overdue/i.test(b.textContent || ''))`
+    const overdueBtnBefore = await bob.eval(
+      `(() => { const b = ${findOverdueBtn}; return b ? { text: b.textContent.trim(), title: b.title, pressed: b.getAttribute('aria-pressed') } : null })()`,
+    )
+    check(
+      'the header shows a "1 overdue" toggle, not yet pressed',
+      overdueBtnBefore?.pressed === 'false' &&
+        overdueBtnBefore?.text === '1 overdue' &&
+        overdueBtnBefore?.title === 'Hide overdue pull requests',
+      JSON.stringify(overdueBtnBefore),
+    )
+
+    const clickOverdueBtn = `(() => { const b = ${findOverdueBtn}; if (!b) return false; b.click(); return true })()`
+    await bob.eval(clickOverdueBtn)
+    const hiddenNote = '1 overdue pull request hidden — click the count to show them'
+    const hiddenAfterClick = await until(async () => {
+      const gone = (await bob.eval(`!document.querySelector(${JSON.stringify(overdueRowSel)})`)) === true
+      const noted = (await bob.eval(`document.body.innerText.includes(${JSON.stringify(hiddenNote)})`)) === true
+      return gone && noted ? true : undefined
+    }, 10000, 300)
+    check(
+      'clicking "N overdue" hides the row (all groups) and shows the "hidden" note',
+      !!hiddenAfterClick,
+      hiddenAfterClick ? '' : 'row still present or note missing',
+    )
+
+    const overdueBtnAfter = await bob.eval(
+      `(() => { const b = ${findOverdueBtn}; return b ? { pressed: b.getAttribute('aria-pressed'), title: b.title } : null })()`,
+    )
+    check(
+      'the hidden toggle now reads aria-pressed=true, dimmed, "show again"',
+      overdueBtnAfter?.pressed === 'true' && overdueBtnAfter?.title === 'Show overdue pull requests again',
+      JSON.stringify(overdueBtnAfter),
+    )
+
+    await bob.eval(clickOverdueBtn) // click again — restore
+    const restoredAfterClick = await until(async () => {
+      const back = (await bob.eval(`!!document.querySelector(${JSON.stringify(overdueRowSel)})`)) === true
+      const noteGone = (await bob.eval(`!document.body.innerText.includes(${JSON.stringify(hiddenNote)})`)) === true
+      return back && noteGone ? true : undefined
+    }, 10000, 300)
+    check('clicking "N overdue" again restores the row and clears the note', !!restoredAfterClick)
+
+    // 1.5 regression pin: hiding must not strand an unseen badge.
+    // `PrsStatus.unseen` (the sidebar's red count and the OS dock badge) counts
+    // tracked, non-approved PRs with seen:false, and the hide toggle persists
+    // per device — so a PR that arrives *while hidden* still has to be marked
+    // seen by the pane's dwell, or nothing in the UI could ever clear it again.
+    await bob.eval(clickOverdueBtn) // hide again, before the new PR arrives
+    // The dwell only marks seen while the window really has focus, and the
+    // second instance does not have it — simulate it for this check.
+    await bob.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {})
+    const bobFocused = (await bob.eval(`document.hasFocus()`)) === true
+    ado.state.prs['repo-api'].push(
+      adoPr({
+        id: 4302,
+        repo: ADO_REPOS[1],
+        title: 'Ancient: retire the v1 webhook',
+        author: DANA,
+        source: 'dana/retire-v1-webhook',
+        target: 'release/24.9',
+        reviewers: [{ ...ME_REVIEWER, vote: 0, isRequired: true }],
+        ageH: 96,
+      }),
+    )
+    const twoHiddenNote = '2 overdue pull requests hidden — click the count to show them'
+    const arrivedHidden = await until(async () => {
+      await bob.eval(`window.bridge.prs.refresh()`).catch(() => {})
+      const l = await bob.eval(`window.bridge.prs.list()`)
+      const p = l?.find((x) => x.id === 4302)
+      if (p?.state?.overdue !== true) return undefined
+      const gone = (await bob.eval(`!document.querySelector('[aria-label^="Pull request 4302,"]')`)) === true
+      const noted = (await bob.eval(`document.body.innerText.includes(${JSON.stringify(twoHiddenNote)})`)) === true
+      return gone && noted ? p : undefined
+    }, 30000)
+    check(
+      'a pull request that arrives already overdue is hidden on arrival, and the note counts it ("2 … hidden")',
+      arrivedHidden?.state?.overdue === true,
+      arrivedHidden ? '' : 'never arrived, or its row rendered, or the note did not reach 2',
+    )
+    const seenWhileHidden = bobFocused
+      ? await until(async () => {
+          const l = await bob.eval(`window.bridge.prs.list()`)
+          return l?.find((x) => x.id === 4302)?.seen === true ? true : undefined
+        }, 15000, 300)
+      : false
+    if (bobFocused) {
+      check(
+        'the hidden pull request is still marked seen — the unseen and dock badges can clear',
+        !!seenWhileHidden,
+        seenWhileHidden ? '' : 'still unseen after the dwell: hiding stranded the badge',
+      )
+    } else {
+      soft('the hidden pull request is still marked seen', false, 'could not simulate focus on this instance')
+    }
+    await bob.send('Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {})
+    await bob.eval(clickOverdueBtn) // leave the toggle off, as bob found it
+
+    // Back to the chat view: bob.png below is the run's headline screenshot and
+    // has shown #general since 1.0 — the pane hops above are for the pane shots.
+    await bob.eval(
+      `(() => { const el = document.querySelector('button.sem-row[aria-label^="Channel general"]');` +
+        ` if (!el) return false; el.click(); return true })()`,
     )
 
     await sleep(1200)

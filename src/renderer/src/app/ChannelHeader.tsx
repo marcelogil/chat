@@ -1,14 +1,97 @@
+import { useState } from 'react'
+import type { ReactNode } from 'react'
 import type { ConvId } from '@shared/types'
 import { useStore } from '@/store'
 import { Avatar, IconButton, identityHue } from '@/ui/atoms'
 import { ShareButton } from '@/screenshare/ShareUi'
 import { truncate } from './chrome'
-import { IconLock, IconPanel, IconPin } from './icons'
+import { IconLock, IconPanel, IconPencil, IconPin } from './icons'
+import { ConvRenameInput } from './ConvRename'
+import { FIXED_CHANNEL_REFUSAL, type RenameKind } from './renamePlan'
 import { useDmMap, useGroupMap } from './dm'
 import { PersonLines } from './PersonLines'
 import type { RailTab } from './RightRail'
 
 // Spec §2.3 — 52px conversation header with the right-rail controls.
+
+/**
+ * The name, as a button that starts the inline rename (1.5), with a pencil
+ * beside it so the affordance is visible rather than folklore. The home
+ * channel keeps a plain label and says why in its tooltip.
+ */
+function HeaderName({
+  name,
+  kind,
+  fixed,
+  onRename,
+  children,
+}: {
+  name: string
+  kind: RenameKind
+  fixed?: boolean
+  onRename: () => void
+  children?: ReactNode
+}) {
+  const [hover, setHover] = useState(false)
+  const label = { fontSize: 17, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' } as const
+  if (fixed) {
+    return (
+      <>
+        {children}
+        <span title={FIXED_CHANNEL_REFUSAL} style={label}>
+          {name}
+        </span>
+      </>
+    )
+  }
+  return (
+    <span
+      style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      {children}
+      {/* The pencil lives *inside* the button: a revealed affordance that does
+          nothing when clicked is worse than no affordance at all. */}
+      <button
+        className="sem-focus"
+        onClick={onRename}
+        onFocus={() => setHover(true)}
+        onBlur={() => setHover(false)}
+        title={`Rename ${kind === 'channel' ? `#${name}` : name}`}
+        aria-label={`Rename ${kind === 'channel' ? `#${name}` : name}`}
+        style={{
+          ...label,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 4,
+          minWidth: 0,
+          padding: '2px 4px',
+          margin: '0 -4px',
+          border: 'none',
+          background: 'transparent',
+          borderRadius: 'var(--r-sm)',
+          fontFamily: 'var(--font-ui)',
+          cursor: 'text',
+        }}
+      >
+        <span style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
+        <span
+          aria-hidden="true"
+          style={{
+            display: 'flex',
+            flexShrink: 0,
+            color: 'var(--text-3)',
+            opacity: hover ? 1 : 0,
+            transition: 'opacity var(--t-instant) var(--ease-standard)',
+          }}
+        >
+          <IconPencil size={13} />
+        </span>
+      </button>
+    </span>
+  )
+}
 
 export default function ChannelHeader({
   conv,
@@ -32,6 +115,10 @@ export default function ChannelHeader({
   const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
   const members = presence.filter((p) => !p.departed).length + 1
+  // 1.5 — renaming from the header. Keyed on the conv so switching
+  // conversations mid-edit can never land the typed name on the new one.
+  const [renaming, setRenaming] = useState<ConvId | null>(null)
+  const isRenaming = renaming === conv
 
   return (
     <div
@@ -48,21 +135,31 @@ export default function ChannelHeader({
     >
       {channel ? (
         <>
-          <span
-            aria-hidden="true"
-            style={{
-              fontSize: 17,
-              fontWeight: 600,
-              color: identityHue(channel.name),
-              filter: 'saturate(0.6)',
-              userSelect: 'none',
-            }}
-          >
-            #
-          </span>
-          <span style={{ fontSize: 17, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' }}>
-            {channel.name}
-          </span>
+          {isRenaming && !channel.fixed ? (
+            <ConvRenameInput
+              conv={conv}
+              kind="channel"
+              current={channel.name}
+              fixed={channel.fixed}
+              onDone={() => setRenaming(null)}
+              style={{ height: 30, fontSize: 15, maxWidth: 320 }}
+            />
+          ) : (
+            <HeaderName name={channel.name} kind="channel" fixed={channel.fixed} onRename={() => setRenaming(conv)}>
+              <span
+                aria-hidden="true"
+                style={{
+                  fontSize: 17,
+                  fontWeight: 600,
+                  color: identityHue(channel.name),
+                  filter: 'saturate(0.6)',
+                  userSelect: 'none',
+                }}
+              >
+                #
+              </span>
+            </HeaderName>
+          )}
           <span style={{ fontSize: 13, color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
             {members} member{members === 1 ? '' : 's'}
           </span>
@@ -87,12 +184,21 @@ export default function ChannelHeader({
         </>
       ) : group ? (
         <>
-          <span aria-hidden="true" style={{ display: 'flex', color: 'var(--text-2)' }}>
-            <IconLock size={16} />
-          </span>
-          <span style={{ fontSize: 17, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' }}>
-            {group.name}
-          </span>
+          {isRenaming ? (
+            <ConvRenameInput
+              conv={conv}
+              kind="group"
+              current={group.name}
+              onDone={() => setRenaming(null)}
+              style={{ height: 30, fontSize: 15, maxWidth: 320 }}
+            />
+          ) : (
+            <HeaderName name={group.name} kind="group" onRename={() => setRenaming(conv)}>
+              <span aria-hidden="true" style={{ display: 'flex', color: 'var(--text-2)' }}>
+                <IconLock size={16} />
+              </span>
+            </HeaderName>
+          )}
           <span style={{ fontSize: 13, color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
             {group.members.length} member{group.members.length === 1 ? '' : 's'}
           </span>

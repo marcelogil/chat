@@ -2,13 +2,23 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AdoError, AdoErrorCode, PrView } from '@shared/types'
 import { useStore } from '@/store'
 import { Avatar, Button, IconButton, Spinner } from '@/ui/atoms'
-import { IconExternal, IconGear, IconGitPull, IconRefresh, IconWarn } from '@/app/icons'
+import { IconExternal, IconEyeOff, IconGear, IconGitPull, IconRefresh, IconWarn } from '@/app/icons'
 import { NotificationsBell, NotificationsPopover } from '@/app/NotificationsPopover'
 import { truncate } from '@/app/chrome'
 import { toast } from '@/app/toasts'
 import { PrsPrefs } from './PrsPrefs'
 import { DEFAULT_THRESHOLDS, groupPrs, nextLine, waitLabel } from './prsGroups'
 import type { PrsThresholds } from './prsGroups'
+import {
+  applyVisibility,
+  readVisibility,
+  seenKeys,
+  toggleOverdue,
+  toggleStale,
+  visibilityNotes,
+  writeVisibility,
+} from './prsVisibility'
+import type { PrsVisibility } from './prsVisibility'
 import { PrStateChip, prStateTooltip } from './PrStateChip'
 
 // Spec §2.7 — the pull-request pane. Owns the whole centre column (no channel
@@ -489,6 +499,52 @@ function TokenCard({ baseUrl }: { baseUrl: string }) {
   )
 }
 
+/**
+ * 1.5 — the header's "N overdue"/"N stale" pill, doubling as a hide toggle.
+ * Hidden state reads unmistakably at a glance: dimmed, an eye-off glyph, and
+ * `aria-pressed` for anyone using a screen reader instead of looking at it.
+ */
+function CountToggle({
+  count,
+  word,
+  color,
+  hidden,
+  onToggle,
+}: {
+  count: number
+  word: 'overdue' | 'stale'
+  color: string
+  hidden: boolean
+  onToggle: () => void
+}) {
+  return (
+    <button
+      type="button"
+      className="sem-focus"
+      aria-pressed={hidden}
+      title={hidden ? `Show ${word} pull requests again` : `Hide ${word} pull requests`}
+      onClick={onToggle}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        border: 'none',
+        background: 'transparent',
+        padding: 0,
+        cursor: 'pointer',
+        fontFamily: 'var(--font-ui)',
+        fontSize: 11,
+        fontWeight: 600,
+        color,
+        opacity: hidden ? 0.55 : 1,
+      }}
+    >
+      {hidden && <IconEyeOff size={11} />}
+      {count} {word}
+    </button>
+  )
+}
+
 /** A group section header (spec §2 U a11y: a real heading, not just styled text). */
 function GroupHeader({ label, count }: { label: string; count: number }) {
   return (
@@ -527,6 +583,16 @@ export function PrsPane() {
   const [refreshing, setRefreshing] = useState(false)
   /** 1.4 — the notification controls popover, anchored to the header bell. */
   const [notifyOpen, setNotifyOpen] = useState(false)
+  /** 1.5 — per-device "N overdue"/"N stale" hide toggles (localStorage, survives restarts). */
+  const [visibility, setVisibility] = useState<PrsVisibility>(() => readVisibility())
+  // Functional updates, and the write lives in an effect keyed on the result:
+  // two clicks inside one React batch then compose into the original state and
+  // localStorage follows what was rendered, never a value read mid-batch.
+  const toggleHideOverdue = () => setVisibility(toggleOverdue)
+  const toggleHideStale = () => setVisibility(toggleStale)
+  useEffect(() => {
+    writeVisibility(visibility)
+  }, [visibility])
 
   const meId = status?.me?.id ?? null
   const repos = useMemo(() => status?.repos ?? [], [status])
@@ -581,20 +647,29 @@ export function PrsPane() {
       .sort((a, b) => b.createdAt - a.createdAt || (a.key < b.key ? -1 : 1))
   }, [prs, scope, branch, repoId, query, meId])
 
+  // 1.5 — the header's "N overdue"/"N stale" toggles, applied after the
+  // filters above and before grouping. `filtered` (not `visible`) is what the
+  // header counts itself off, below, so hiding a PR never drops its own count
+  // to 0 — hiding is "stop showing me these", not "stop counting them".
+  const visible = useMemo(() => applyVisibility(filtered, visibility), [filtered, visibility])
+
   // Seen marking (spec §2.7): only while this machine actually has the window,
   // and only after a 1.5s dwell — opening the pane by accident must not clear
   // the team's red badge. The keys string is the dependency, so a push that
-  // merely flips `seen` does not re-arm the timer.
-  const visibleKeys = useMemo(() => filtered.map((p) => p.key).join(' '), [filtered])
+  // merely flips `seen` does not re-arm the timer. 1.5: counted off `filtered`,
+  // *not* `visible` — a PR hidden by a persisted toggle would otherwise keep
+  // the sidebar and dock badges lit forever with no way to clear them. See
+  // `seenKeys`.
+  const markKeys = useMemo(() => seenKeys(filtered).join(' '), [filtered])
   const timerRef = useRef<number | null>(null)
   useEffect(() => {
-    if (visibleKeys === '') return undefined
+    if (markKeys === '') return undefined
     const arm = (): void => {
       if (!document.hasFocus() || timerRef.current !== null) return
       timerRef.current = window.setTimeout(() => {
         timerRef.current = null
         if (!document.hasFocus()) return
-        void window.bridge.prs.markSeen(visibleKeys.split(' ')).catch(() => {})
+        void window.bridge.prs.markSeen(markKeys.split(' ')).catch(() => {})
       }, 1500)
     }
     arm()
@@ -606,7 +681,7 @@ export function PrsPane() {
         timerRef.current = null
       }
     }
-  }, [visibleKeys])
+  }, [markKeys])
 
   async function refresh() {
     if (refreshing) return
@@ -636,15 +711,17 @@ export function PrsPane() {
     ? { reviewSlaHours: status.reviewSlaHours, staleAfterDays: status.staleAfterDays }
     : DEFAULT_THRESHOLDS
   const now = Date.now()
-  const groups = groupPrs(filtered, meId, now)
+  const groups = groupPrs(visible, meId, now)
   // Counted from `filtered`, not from `PrsStatus` — the chip sits next to the
   // "N shown of M tracked" count and above a filtered list, so a team-wide
   // number there reads as a claim about what you are looking at. The title
   // says which list it counted, and `PrsStatus.overdue/stale` stay the
-  // team-wide numbers the sidebar subtitle uses.
+  // team-wide numbers the sidebar subtitle uses. Deliberately `filtered`, not
+  // `visible`: hiding overdue/stale PRs must never make their own count read 0.
   const overdue = filtered.reduce((n, p) => n + (p.state?.overdue ? 1 : 0), 0)
   const stale = filtered.reduce((n, p) => n + (p.state?.stale ? 1 : 0), 0)
   const shownOf = filtered.length === prs.length ? 'tracked' : 'shown'
+  const notes = visibilityNotes(filtered, visibility)
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-app)' }}>
@@ -713,9 +790,25 @@ export function PrsPane() {
               flexShrink: 0,
             }}
           >
-            {overdue > 0 && <span style={{ color: 'var(--warning)' }}>{overdue} overdue</span>}
+            {overdue > 0 && (
+              <CountToggle
+                count={overdue}
+                word="overdue"
+                color="var(--warning)"
+                hidden={visibility.hideOverdue}
+                onToggle={toggleHideOverdue}
+              />
+            )}
             {overdue > 0 && stale > 0 && <span style={{ color: 'var(--text-3)' }}>·</span>}
-            {stale > 0 && <span style={{ color: 'var(--danger)' }}>{stale} stale</span>}
+            {stale > 0 && (
+              <CountToggle
+                count={stale}
+                word="stale"
+                color="var(--danger)"
+                hidden={visibility.hideStale}
+                onToggle={toggleHideStale}
+              />
+            )}
           </span>
         )}
         <span
@@ -872,6 +965,15 @@ export function PrsPane() {
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: '10px 16px 16px' }}>
+            {notes.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                {notes.map((note) => (
+                  <div key={note} style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            )}
             {groups.map((g) => (
               <div key={g.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {g.key !== 'legacy' && <GroupHeader label={g.label} count={g.prs.length} />}

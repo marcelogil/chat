@@ -11,6 +11,7 @@ import type { SecretStore } from '../store/secretStore'
 import { BeaconWriter } from './beacon'
 import { createOrJoinTeam } from './bootstrap'
 import { Roster } from './roster'
+import { selfPresenceView } from './selfPresence'
 import { Session } from './session'
 import { ShareIo } from './shareIo'
 
@@ -160,7 +161,7 @@ const publishes = (log: string[]): string[] => log.filter((l) => l.startsWith('p
  * the event loop that `advanceTimersByTimeAsync` hands back.
  */
 async function settle(): Promise<void> {
-  for (let i = 0; i < 30; i++) await vi.advanceTimersByTimeAsync(1)
+  for (let i = 0; i < 60; i++) await vi.advanceTimersByTimeAsync(1)
 }
 
 describe('BeaconWriter tiers', () => {
@@ -229,6 +230,263 @@ describe('BeaconWriter tiers', () => {
       writer.setTier('paused', 0)
       await settle()
       expect(readBeacon(session, beaconNames(session)[0]).presence.state).toBe('offline')
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Gil's always-online preference (1.5)
+//
+// `getAlwaysOnline` is pulled fresh on every heartbeat decision and every
+// publish — the same seam chatService/prService use for `getSettings()` — so
+// it needs no dedicated "settings changed" plumbing to take effect.
+
+describe('BeaconWriter tiers — always-online (1.5)', () => {
+  it('keeps the heartbeat beating through a pause, carrying online/0', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0) // screen locked
+      await settle()
+
+      const first = readBeacon(session, beaconNames(session)[0])
+      expect(first.presence.state).toBe('online')
+      expect(first.presence.idleSec).toBe(0)
+
+      // Unlike a plain pause, this device keeps writing at the idle cadence —
+      // that is the whole point: peers keep seeing green.
+      log.length = 0
+      await vi.advanceTimersByTimeAsync(BEACON.idleHeartbeatMs + BEACON.heartbeatJitterMs + 1_000)
+      await settle() // let the fired heartbeat's real mkdir+write+rename finish
+      expect(publishes(log).length).toBeGreaterThan(0)
+
+      const latest = readBeacon(session, beaconNames(session)[0])
+      expect(latest.presence.state).toBe('online')
+      expect(latest.presence.idleSec).toBe(0)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('reports idleSec 0 on the idle tier too, not the truthful count', async () => {
+    const session = await soloSession()
+    instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('idle', 300)
+      await settle()
+
+      const content = readBeacon(session, beaconNames(session)[0])
+      expect(content.presence.state).toBe('online')
+      expect(content.presence.idleSec).toBe(0)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('leaves behaviour exactly as today when the setting is off', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => false)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      log.length = 0
+      writer.setTier('paused', 0)
+      await settle()
+      expect(publishes(log)).toHaveLength(1) // the one goodbye beacon
+
+      const content = readBeacon(session, beaconNames(session)[0])
+      expect(content.presence.state).toBe('away')
+      expect(content.presence.idleSec).toBeGreaterThanOrEqual(PRESENCE.awayIdleSec)
+
+      // ...and then nothing, exactly like a paused device always did.
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(publishes(log)).toHaveLength(1)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('still loses to appear-offline: state stays offline and the heartbeat goes quiet', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    try {
+      writer.setPresence({ state: 'offline' })
+      writer.start()
+      await settle()
+      expect(readBeacon(session, beaconNames(session)[0]).presence.state).toBe('offline')
+
+      writer.setTier('paused', 0)
+      await settle()
+      expect(readBeacon(session, beaconNames(session)[0]).presence.state).toBe('offline')
+
+      // Nothing left to keep looking online for, so — unlike the first test in
+      // this block — this stays silent exactly like a plain paused,
+      // appear-offline device.
+      const before = publishes(log).length
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(publishes(log)).toHaveLength(before)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Always-online, second pass (1.5). The content half of the setting is pulled
+// fresh at every publish and needs no wiring; the *schedule* half does, because
+// a paused device that is not beating has no next publish to re-decide on.
+// `syncHeartbeat()` is what ChatService.onSettingsChanged calls.
+
+describe('BeaconWriter — always-online schedule and the presence it publishes (1.5)', () => {
+  it('starts beating when the setting is turned on behind a locked screen', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    let on = false
+    const writer = new BeaconWriter(session, () => '', () => on)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0) // screen locked, setting still off
+      await settle()
+      log.length = 0
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await settle()
+      expect(publishes(log)).toHaveLength(0) // silent, like any paused device
+
+      on = true
+      writer.syncHeartbeat()
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await settle()
+      expect(publishes(log).length).toBeGreaterThan(0)
+      const latest = readBeacon(session, beaconNames(session)[0])
+      expect(latest.presence.state).toBe('online')
+      expect(latest.presence.idleSec).toBe(0)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('goes quiet again when the setting is turned off behind a locked screen', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    let on = true
+    const writer = new BeaconWriter(session, () => '', () => on)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0)
+      await settle()
+      log.length = 0
+      await vi.advanceTimersByTimeAsync(BEACON.idleHeartbeatMs + BEACON.heartbeatJitterMs + 1_000)
+      await settle()
+      expect(publishes(log).length).toBeGreaterThan(0) // beating
+
+      on = false
+      writer.syncHeartbeat()
+      log.length = 0
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await settle()
+      expect(publishes(log)).toHaveLength(0) // and back to today's paused silence
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('stops beating when appear-offline is chosen after the screen is already locked', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0)
+      await settle()
+      writer.setPresence({ state: 'offline' }) // the other order from the test above
+      await settle()
+      expect(readBeacon(session, beaconNames(session)[0]).presence.state).toBe('offline')
+
+      // Nothing left to look online for: a deliberately invisible, paused
+      // device must not keep writing to the share every 45 s forever.
+      const before = publishes(log).length
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await settle()
+      expect(publishes(log)).toHaveLength(before)
+    } finally {
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('beats at exactly BEACON.idleHeartbeatMs while keeping green — no jitter on top', async () => {
+    const session = await soloSession()
+    const log = instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    // The worst jitter draw there is: on a jittered schedule this pushes the
+    // first beat to 45 s + 3 s, past what a peer will still call online.
+    const rand = vi.spyOn(Math, 'random').mockReturnValue(0.999)
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0)
+      await settle()
+      log.length = 0
+      await vi.advanceTimersByTimeAsync(BEACON.idleHeartbeatMs)
+      await settle()
+      expect(publishes(log).length).toBeGreaterThan(0)
+      // Which is what buys the peer its margin: the poller ages a beacon from
+      // its own `hlc` against PRESENCE.onlineWithinMs.
+      expect(BEACON.idleHeartbeatMs).toBeLessThan(PRESENCE.onlineWithinMs)
+    } finally {
+      rand.mockRestore()
+      await writer.stop(false)
+    }
+  }, 60_000)
+
+  it('shows this device the presence it published, not the truthful one underneath', async () => {
+    const session = await soloSession()
+    instrument(session, [])
+    const writer = new BeaconWriter(session, () => '', () => true)
+    vi.useFakeTimers()
+    try {
+      writer.start()
+      await settle()
+      writer.setTier('paused', 0)
+      await settle()
+
+      const onShare = readBeacon(session, beaconNames(session)[0]).presence
+      expect(onShare.state).toBe('online')
+      expect(onShare.idleSec).toBe(0)
+      // The truthful state is kept, untouched, underneath the override...
+      expect(writer.presence.state).toBe('away')
+      expect(writer.presence.idleSec).toBeGreaterThanOrEqual(PRESENCE.awayIdleSec)
+      // ...and everything that must agree with the share reads it through here.
+      expect(writer.publishedPresence).toEqual(onShare)
+      const self = selfPresenceView({
+        deviceId: session.deviceId,
+        name: 'Me',
+        hostname: '',
+        fingerprint: '',
+        presence: writer.publishedPresence,
+        nowMs: Date.now(),
+      })
+      expect(self.state).toBe('online')
     } finally {
       await writer.stop(false)
     }

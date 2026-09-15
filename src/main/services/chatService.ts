@@ -25,6 +25,7 @@ import type {
 import type { AttachDraft } from '@shared/bridge'
 import { DIAGRAM, DIR, TEAM_CONV } from '@shared/constants'
 import { diagramFallbackText, diagramFitsInline, diagramPreview } from '@shared/diagram'
+import { isGil } from '@shared/gilMode'
 import { materialize } from '@shared/merge'
 import type { MessageView } from '@shared/merge'
 import {
@@ -37,6 +38,7 @@ import {
   validatePollDraft,
 } from '@shared/poll'
 import { isChanConv, isDmConv, isGrpConv, isTeamConv, sanitizeHostname } from '@shared/ids'
+import { isValidTeamName, normalizeTeamName } from '@shared/teamName'
 import { shouldNotifyChat } from '@shared/notifyDecision'
 import { EventStore } from '../transport/events'
 import { BeaconWriter } from '../transport/beacon'
@@ -47,6 +49,7 @@ import type { IoTier } from './ioTier'
 import type { Session } from '../transport/session'
 import { boardLiveIsFresh, boardLiveNotifyLine } from './boards'
 import { fixedChannelId, foldChannelSys, normalizeChannelName } from './channels'
+import { foldTeamRenamed, teamRenamePayload, type EventAuthor, type TeamNameFold } from './teamSettings'
 import { GroupService } from './groups'
 import { notifyLineFor } from './notifyLine'
 
@@ -59,7 +62,9 @@ import { notifyLineFor } from './notifyLine'
  */
 type OutboxItem =
   | { conv: ConvId; type: 'msg'; payload: MsgPayload }
-  | { conv: `team:${string}`; type: 'cal' | 'prs'; payload: CalPayload | PrsPayload }
+  // `sys` (1.5) is the team-settings write — a team rename queues and replays
+  // exactly like a calendar entry, so the name lands when the folder is back.
+  | { conv: `team:${string}`; type: 'cal' | 'prs' | 'sys'; payload: CalPayload | PrsPayload | SysPayload }
 
 /** Newest event stem this device has read in a conversation, and when. */
 interface ReadMark {
@@ -86,6 +91,20 @@ export class ChatService {
   attachmentUploader: ((items: AttachDraft[], conv: ConvId) => Promise<Attachment[]>) | null = null
   /** Set by the update service (1.2): a verified beacon named a newer build. */
   peerVersionHandler: ((version: string, name: string) => void) | null = null
+  /**
+   * The team name as protocol.json spells it (1.5). Set by AppController
+   * before `start()`; it is what {@link teamName} answers until somebody
+   * renames the team, and what a fold that refuses every event falls back to.
+   */
+  teamNameBase = ''
+  /** Winning `team-renamed` so far — LWW by event id (services/teamSettings.ts). */
+  private teamNameFold: TeamNameFold | null = null
+  /**
+   * Set by AppController after `start()`: the folded team name changed, so
+   * `BootMode.self.teamName` has to follow it (the renderer's own copy travels
+   * in the `team` push this service sends alongside).
+   */
+  teamNameHandler: ((teamName: string) => void) | null = null
   /** Current share-I/O tier (1.2); `diag:shareStats` reports it. */
   ioTier: IoTier = 'blurred'
 
@@ -97,7 +116,7 @@ export class ChatService {
     private getAppVersion: () => string = () => '',
   ) {
     this.events = new EventStore(session)
-    this.beacon = new BeaconWriter(session, getAppVersion)
+    this.beacon = new BeaconWriter(session, getAppVersion, () => getSettings().alwaysOnline === true)
     this.poller = new Poller(session, this.events)
     // Registers itself as the session's `grp:` provider — construct it before
     // anything can try to read a group conversation.
@@ -118,6 +137,9 @@ export class ChatService {
    * by construction, so the footer had nothing to show: the status you set was
    * live on the share and invisible at home. Built from the live beacon, so it
    * is true the instant setStatus/setAppearState returns.
+   *
+   * `publishedPresence`, not the raw field: this row has to say what the share
+   * says about us, and with always-online on (1.5) those differ by design.
    */
   selfPresence(): PresenceView {
     const s = this.session
@@ -127,7 +149,7 @@ export class ChatService {
       name: s.displayName,
       hostname: sanitizeHostname(entry?.record.hostname ?? ''),
       fingerprint: entry ? fingerprintFromEdPub(entry.pin.edPub) : s.identity.fingerprint,
-      presence: this.beacon.presence,
+      presence: this.beacon.publishedPresence,
       nowMs: s.io.calibratedNow(),
       app: this.getAppVersion(),
     })
@@ -141,6 +163,20 @@ export class ChatService {
 
   pushSelfPresence(): void {
     this.push({ kind: 'self-presence', view: this.selfPresence() })
+  }
+
+  /**
+   * Settings were patched (AppController.setSettings). Beacon *content* pulls
+   * `getSettings()` fresh at every publish and needs nothing, but a beacon
+   * that is not beating has no next publish to re-decide on: turning
+   * always-online on behind a locked screen (1.5) has to start the heartbeat,
+   * and turning it off has to stop it. The footer row is re-pushed for the
+   * same reason — the dot follows the setting immediately, not at the next
+   * poll tick.
+   */
+  onSettingsChanged(): void {
+    this.beacon.syncHeartbeat()
+    this.pushSelfPresence()
   }
 
   async start(): Promise<void> {
@@ -334,6 +370,17 @@ export class ChatService {
    */
   private foldSys(conv: ConvId, event: VerifiedEvent): void {
     if (event.type !== 'sys' && event.type !== 'grp') return
+    // Team settings (1.5): the one team log whose events change something the
+    // whole app displays. Folded here so the `team` push that follows is
+    // already the new truth, exactly like a channel rename.
+    if (isTeamConv(conv)) {
+      const next = foldTeamRenamed(this.teamNameFold, conv, event, (d) => this.rosterAuthor(d))
+      if (!next) return
+      this.teamNameFold = next
+      this.push({ kind: 'team', teamName: next.name })
+      this.teamNameHandler?.(next.name)
+      return
+    }
     if (isChanConv(conv)) {
       if (event.type !== 'sys') return
       const ch = this.session.channels.get(conv.slice(5))
@@ -459,11 +506,57 @@ export class ChatService {
    */
   async publishTeam(
     conv: `team:${string}`,
-    type: 'cal' | 'prs',
-    payload: CalPayload | PrsPayload,
+    type: 'cal' | 'prs' | 'sys',
+    payload: CalPayload | PrsPayload | SysPayload,
   ): Promise<{ queued: boolean }> {
     const ev = await this.publishWithOutbox({ conv, type, payload })
     return { queued: ev === null }
+  }
+
+  /**
+   * The team's name as this device sees it (1.5): the folded `team-renamed`
+   * if anyone has renamed it, else whatever protocol.json said at creation.
+   */
+  teamName(): string {
+    return this.teamNameFold?.name ?? this.teamNameBase
+  }
+
+  /**
+   * What the roster knows about an event's author — the name it registered
+   * under and how this device pinned it. The team-settings fold asks this to
+   * decide whether a rename came from an admin (services/teamSettings.ts).
+   */
+  private rosterAuthor(deviceId: string): EventAuthor | null {
+    const entry = this.session.roster.get(deviceId)
+    return entry ? { displayName: entry.record.displayName, trust: entry.pin.trust } : null
+  }
+
+  /**
+   * Rename the team for everyone (1.5). Only an admin may do it — today, only
+   * Gil (`TEAM_ADMIN_NAMES`) — and the write goes through the ordinary team
+   * publish path, so an unreachable share queues it rather than failing (the
+   * Settings field then says "will save when the folder is back" instead of
+   * inviting a retry). The fold, the `team` push and the SelfView update all
+   * happen on the way back through `foldSys`.
+   *
+   * `not-admin` is thrown before anything else is even looked at, and it is a
+   * courtesy rather than the enforcement: this is the writer's own machine, and
+   * a shared folder cannot refuse a write. The rule that holds is that every
+   * *reader* ignores a `team-renamed` from a non-admin (services/teamSettings.ts).
+   *
+   * `{ queued: false }` means "nothing is waiting", **not** "an event was
+   * written": renaming the team to the name it already has publishes nothing
+   * and returns the same thing, because an event that changes no name is only
+   * noise in a log every client folds forever. A caller that wants to tell the
+   * two apart compares the name it asked for with the name it had (the
+   * Settings pane does — `teamRenameSaveNotice`).
+   */
+  async renameTeam(name: string): Promise<{ queued: boolean }> {
+    if (!isGil(this.session.displayName)) throw new Error('not-admin')
+    const clean = normalizeTeamName(name)
+    if (!isValidTeamName(clean)) throw new Error('invalid-name')
+    if (clean === this.teamName()) return { queued: false }
+    return this.publishTeam(TEAM_CONV.settings, 'sys', teamRenamePayload(clean))
   }
 
   /**

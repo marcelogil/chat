@@ -63,6 +63,10 @@ the only thing every machine can reach is an SMB share.
 - **Team calendar** — releases, freezes, birthdays, one shared calendar per
   team with colours, tags, and yearly repeats, synced through the same
   encrypted folder as everything else.
+- **Daily calendar toast** — once a day, per team folder, a toast sums up
+  what the calendar says about today: a birthday first, then any event
+  covering today, otherwise a countdown to what's next. Quiet the rest of
+  the day, and it steps aside while the calendar pane itself is open.
 - **Pull requests** — watch Azure DevOps repos from inside Chat: a red
   sidebar badge and popup when a PR needs your review, filters (assigned to
   me / mine / by branch), and every pull request shows who it's waiting on
@@ -71,7 +75,10 @@ the only thing every machine can reach is an SMB share.
   listed under "Ready to complete" instead of disappearing, and one with no
   activity for 14+ days is called out as stale; both thresholds live in the
   PR settings. The watched repo list can be edited any time — Chat re-checks
-  the saved connection on its own, no re-pasting a token.
+  the saved connection on its own, no re-pasting a token. The "N overdue" /
+  "N stale" counts above the list are also click-to-hide, per device — they
+  keep counting while hidden, so the sidebar badge never gets stuck behind a
+  toggle you forgot about.
 - **Notification controls** — a bell in the sidebar and in the pull-request
   pane gives quick control over both: pull requests (All / Only mine /
   Paused) and chat (Everything / Only about me / Nothing), plus a one-click
@@ -79,6 +86,16 @@ the only thing every machine can reach is an SMB share.
   Settings) are honoured everywhere this covers — chat, pull requests, and
   the in-app pull-request alert alike; a beam offer still comes through
   regardless, since someone on the other end is waiting for an answer.
+- **Admin panel** — Settings → Admin, visible only to whoever is named Gil
+  (there's no server to hold a real permissions list, so "admin" is a display
+  name). From there: rename the team — every other client folds the change
+  within a few seconds, and one still on an older build just keeps seeing the
+  original name — and a personal "always look online" toggle, just for him.
+- **Message easter eggs** — a beetle scurries across the window for a
+  mention of a bug, confetti falls for a congratulations, in English,
+  French, German/Swiss German or Portuguese; strictly reader-side (nothing
+  rides the wire), once per message, and off entirely when the OS asks for
+  reduced motion. Toggle it in Settings → Appearance.
 
 ## How messages are secured (even from someone with the passphrase)
 

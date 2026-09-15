@@ -14,24 +14,31 @@ interface ToastItem {
 
 let nextId = 1
 
+const DEFAULT_MS = 5000
+
 const useToastStore = create<{
   list: ToastItem[]
-  push(text: string, tone: ToastTone): void
+  push(text: string, tone: ToastTone, ms: number): void
   dismiss(id: number): void
 }>((set) => ({
   list: [],
-  push(text, tone) {
+  push(text, tone, ms) {
     const id = nextId++
     set((s) => ({ list: [...s.list.slice(-2), { id, text, tone }] }))
-    window.setTimeout(() => set((s) => ({ list: s.list.filter((t) => t.id !== id) })), 5000)
+    window.setTimeout(() => set((s) => ({ list: s.list.filter((t) => t.id !== id) })), ms)
   },
   dismiss(id) {
     set((s) => ({ list: s.list.filter((t) => t.id !== id) }))
   },
 }))
 
-export function toast(text: string, tone: ToastTone = 'info') {
-  useToastStore.getState().push(text, tone)
+/**
+ * `ms` (default 5s) is how long the toast lingers before it auto-dismisses —
+ * the calendar digest (team/CalendarDigest.tsx) asks for ~8s since it is a
+ * one-line summary read once per day, not an error worth cutting short.
+ */
+export function toast(text: string, tone: ToastTone = 'info', ms: number = DEFAULT_MS) {
+  useToastStore.getState().push(text, tone, ms)
 }
 
 const TONE_COLOR: Record<ToastTone, string> = {

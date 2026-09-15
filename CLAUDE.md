@@ -108,7 +108,10 @@ have) · an in-app card for author-side PR transitions (1.4's
 `PrService.trackTransitions`/`notifyTransitions` only ever raise an OS
 notification for "your PR was blocked / commented on / approved" — there is
 no in-app equivalent of `PrAlert` for these, so a focused window sees
-nothing until the pane itself is opened).
+nothing until the pane itself is opened) · revoked pins are not consulted by
+the team-rename fold (`services/teamSettings.ts` checks only `trust !==
+'flagged'`; if a second trust axis is ever wired into an event fold, it
+should be decided for event folds generally, not patched into this one).
 
 ## GIF pack
 
@@ -530,3 +533,60 @@ and `Poller.presenceViews()` marks it `departed` with `PresenceView.supersededBy
   group add-member picker) must therefore run through
   `app/twinDevices.ts::preferFreshestTwin` first: freshest beacon wins, and
   rows already carrying `supersededBy` pass through untouched.
+
+## Admin panel (1.5)
+
+Settings → **Admin** is the one panel not everybody has: the **team name**
+(team-wide) and **Always look online** (personal, unenforced). There is no
+server to grant a role and `protocol.json` is written once, so "admin" is a
+**display name** — `TEAM_ADMIN_NAMES` in `src/shared/constants.ts` (today
+`['gil']`), compared trimmed and case-insensitively by `isGil`
+(`src/shared/gilMode.ts`). **That constant is the only place to change the
+rule**; everything else reads it.
+
+Three gates, and only the third is enforcement:
+
+- `navFor()` in `SettingsModal.tsx` lists the section for an admin only (the
+  body re-checks, so a stale `openSettings('admin')` can't reach it).
+- `ChatService.renameTeam` throws `not-admin` before it looks at the name;
+  the pane says "Only Gil can rename the team" (`teamRenameFailureNotice`).
+- **The fold ignores it** — `foldTeamRenamed`/`foldTeamName`
+  (`services/teamSettings.ts`) take an `AuthorLookup` and accept a
+  `team-renamed` event only when the author's *roster record* says an admin
+  name **and** the author's pin is not `'flagged'`. The first two gates are
+  code on the writer's own machine and a shared folder cannot refuse a write;
+  what stops a rename is that nobody folds it, the writer included.
+
+The `flagged` half is the point: a second device registering under a name
+already pinned to someone else is what `Roster.ingest` TOFU-flags, and it is
+exactly what "type Gil in the onboarding box" looks like. A `revoked` pin is
+deliberately not part of the test — no other event path consults revocation.
+
+The E2E can't drive this from alice: `scripts/e2e-drive.mjs` asserts her
+`team.rename` rejects `not-admin`, then launches a fourth short-lived instance
+(`e2e-gil`, port 9337) that joins as "Gil" to do the rename.
+
+## Message easter eggs (1.5)
+
+Detection is reader-side, in `src/shared/easterEggs.ts` — a message's
+`body.text` is matched against a bug/celebration vocabulary on every client
+independently; nothing rides the wire, so an older build just shows no
+animation, forever. Eligibility (`chat/eggEligibility.ts`) and the
+once-per-id/throttle queue (`app/easterEggQueue.ts`) are separate pure
+modules on purpose — see `docs/features-1.5.md` §3 for the full shape.
+
+## Pull-request header toggles (1.5)
+
+Per-device, `localStorage`-only: `sem-prs-hide-overdue` / `sem-prs-hide-stale`
+(`src/renderer/src/team/prsVisibility.ts`), each written as `'1'` and
+*removed* (never `'0'`) when un-hidden. Hiding a PR from the pane never stops
+it counting toward `PrsStatus.unseen` (the sidebar/dock badge) — `prs.markSeen`
+is always called with the pre-hide list.
+
+## Daily calendar toast (1.5)
+
+Once per calendar day, per **team folder** — keyed in `localStorage` as
+`chat.calendarDigest.lastShown.<sharePath>`, not globally
+(`src/renderer/src/team/CalendarDigest.tsx`). Priority is birthday > an event
+covering today > a countdown; opening the calendar pane suppresses the toast
+without spending the day's attempt.

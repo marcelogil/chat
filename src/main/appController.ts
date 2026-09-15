@@ -174,6 +174,12 @@ export class AppController {
     }
     this.settings = next
     this.store.writeSettings(this.settings)
+    // Services read settings through the `() => this.settings` seam at the
+    // point of decision, so nothing here has to be pushed — except a decision
+    // already taken and now standing still: the beacon heartbeat, which a
+    // paused device (locked screen) is not making any more. 1.5's
+    // always-online lives exactly there.
+    this.chat?.onSettingsChanged()
     return this.settings
   }
 
@@ -446,6 +452,10 @@ export class AppController {
     this.session = session
     this.chat = new ChatService(session, this.getWindow, () => this.settings, () => app.getVersion())
     this.chat.setPush((msg) => this.push(msg))
+    // 1.5 — the name protocol.json was created with. Anything a `team-renamed`
+    // event folds on top of it (including on this cold start, from the log the
+    // catch-up below ingests) wins; see services/teamSettings.ts.
+    this.chat.teamNameBase = proto.teamName
     // The status survives the quit (1.4): put the saved one back before
     // `chat.start()` fires the first beacon, so teammates never see a blank
     // line while this device catches up — and neither does the footer.
@@ -482,7 +492,17 @@ export class AppController {
     )
     this.prs.start()
 
-    this.boot = { mode: 'ready', self: this.selfView(config, proto.teamName) }
+    // 1.5 — a rename published by anyone (including this device) after the
+    // catch-up: the renderer hears it as the `team` push ChatService sends,
+    // and `getBoot()` has to agree, because that is what a window opened later
+    // — or a relaunch that has not re-read the log yet — reads the name from.
+    this.chat.teamNameHandler = (teamName) => {
+      if (this.boot.mode !== 'ready') return
+      this.boot = { mode: 'ready', self: { ...this.boot.self, teamName } }
+    }
+    // The cold-start fold is already in `chat.teamName()` — catchUp(team:settings)
+    // ran inside chat.start(), before this line.
+    this.boot = { mode: 'ready', self: this.selfView(config, this.chat.teamName()) }
   }
 
   private selfView(config: AppConfig, teamName: string): SelfView {

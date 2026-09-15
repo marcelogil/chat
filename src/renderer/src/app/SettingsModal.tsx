@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { SettingsView, ShareStats } from '@shared/bridge'
 import { useStore, selfOf, type SettingsSection } from '@/store'
+import { isGil } from '@shared/gilMode'
 import { isSnoozed, prAlertMode, snoozeChoices } from '@shared/notifyDecision'
 import {
   DEFAULT_QUICK_MESSAGES,
@@ -14,6 +15,7 @@ import { Avatar, DeviceChip, IconButton, Spinner } from '@/ui/atoms'
 import { SectionLabel, Toggle, isMac, truncate } from './chrome'
 import { IconArrowUp, IconLock, IconX } from './icons'
 import { toast } from './toasts'
+import TeamSettings from './TeamSettings'
 
 // Spec §2.6 — settings modal, 720×520, left nav.
 
@@ -22,15 +24,25 @@ import { toast } from './toasts'
 // this component's own state.
 type Section = SettingsSection
 
-const NAV: { id: Section; label: string }[] = [
-  { id: 'profile', label: 'Profile' },
-  { id: 'appearance', label: 'Appearance' },
-  { id: 'notifications', label: 'Notifications' },
-  { id: 'privacy', label: 'Privacy' },
-  { id: 'quickMessages', label: 'Quick messages' },
-  { id: 'storage', label: 'Storage & Share' },
-  { id: 'about', label: 'About' },
-]
+/**
+ * The left nav for one person (1.5). Everything here is the same for everyone
+ * except Admin, which is listed only for an admin — today only Gil (`isGil`,
+ * `TEAM_ADMIN_NAMES`). Hiding it is a courtesy, not the enforcement: the rename
+ * it offers is refused by `ChatService.renameTeam` and, more to the point,
+ * ignored by every other client's fold (main/services/teamSettings.ts).
+ */
+function navFor(displayName: string | null | undefined): { id: Section; label: string }[] {
+  return [
+    { id: 'profile', label: 'Profile' },
+    ...(isGil(displayName) ? [{ id: 'admin' as Section, label: 'Admin' }] : []),
+    { id: 'appearance', label: 'Appearance' },
+    { id: 'notifications', label: 'Notifications' },
+    { id: 'privacy', label: 'Privacy' },
+    { id: 'quickMessages', label: 'Quick messages' },
+    { id: 'storage', label: 'Storage & Share' },
+    { id: 'about', label: 'About' },
+  ]
+}
 
 function Segmented<T extends string>({
   value,
@@ -126,6 +138,7 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
   const boot = useStore((s) => s.boot)
   const self = selfOf(boot)
   const [section, setSection] = useState<Section>(opensOn ?? 'profile')
+  const nav = navFor(self?.displayName)
   const [confirmingFolderChange, setConfirmingFolderChange] = useState(false)
 
   useEffect(() => {
@@ -215,7 +228,7 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
           }}
         >
           <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-1)', padding: '10px 10px 12px' }}>Settings</div>
-          {NAV.map((n) => (
+          {nav.map((n) => (
             <button
               key={n.id}
               className="sem-row sem-focus"
@@ -276,6 +289,31 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
                 </>
               )}
 
+              {/*
+                Admin (1.5) — the one panel not everybody has. It holds the
+                team's name, which is team-wide, and the always-look-online
+                toggle, which is personal; what they share is that only Gil
+                gets to see them. `isGil` is re-checked here and not only in
+                the nav, so the section cannot be reached by a stale
+                `openSettings('admin')` on somebody else's machine.
+              */}
+              {section === 'admin' && isGil(self?.displayName) && (
+                <>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: '15px' }}>
+                    Only Gil sees this panel.
+                  </div>
+                  <TeamSettings />
+                  <Field label="Just for Gil 😉">
+                    <ToggleRow
+                      label="Always look online"
+                      sub="Keeps your status green even while idle or the screen is locked."
+                      on={settings.alwaysOnline === true}
+                      onChange={(v) => void patch({ alwaysOnline: v })}
+                    />
+                  </Field>
+                </>
+              )}
+
               {section === 'appearance' && (
                 <>
                   <Field label="Theme">
@@ -314,6 +352,13 @@ export default function SettingsModal({ onClose, section: opensOn }: { onClose: 
                       onChange={(v) => void patch({ autoplayGifs: v })}
                     />
                   </Field>
+                  {/* 1.5 — absent means on, so the first launch has them. */}
+                  <ToggleRow
+                    label="Message easter eggs"
+                    sub="A beetle runs across the window when someone mentions a bug, confetti falls for congratulations. Always off while the system asks for reduced motion."
+                    on={settings.easterEggs !== false}
+                    onChange={(v) => void patch({ easterEggs: v })}
+                  />
                 </>
               )}
 

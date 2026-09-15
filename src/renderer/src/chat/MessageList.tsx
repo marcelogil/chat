@@ -9,6 +9,7 @@ import { formatDayDivider, formatTime } from '@/ui/atoms'
 import { openLiveBoard } from '@/diagram/collab'
 import { boardJoinAction, type LiveBoardEntry } from '@/diagram/live'
 import { MessageRow } from './MessageRow'
+import { EggSentinel, useEasterEggFeed } from './EasterEggFeed'
 import { dayKeyOf, sysLine, type ChipData } from './util'
 
 // Virtualized message area: day dividers, unread divider, system rows,
@@ -168,6 +169,11 @@ export function MessageList({
     return n
   }, [atBottom, log, selfId])
 
+  // Message easter eggs (1.5): the feed decides, the sentinel under each row
+  // says when that row is genuinely on screen. Both are no-ops when the
+  // setting is off or the message says nothing special.
+  const onEggVisible = useEasterEggFeed({ conv, messages: log.messages, loaded, selfId, anchorRead })
+
   const renderItem = useCallback(
     (_index: number, it: Item) => {
       switch (it.kind) {
@@ -179,25 +185,41 @@ export function MessageList({
           return <SysRow line={sysLine(it.s, nameOf)} action={boardJoinAction(it.s, liveBoards)} />
         case 'msg':
           return (
-            <MessageRow
-              conv={conv}
-              m={it.m}
-              groupStart={it.groupStart}
-              pop={it.pop}
-              selfId={selfId}
-              chip={chipOf(it.m.authorDevice)}
-              receipt={receiptFor && receiptFor.id === it.m.id ? receiptFor.text : null}
-              isEditing={editingId === it.m.id}
-              getMessage={getMessage}
-              nameOf={nameOf}
-              onReply={onReply}
-              onEditStart={onEditStart}
-              onEditDone={onEditDone}
-            />
+            <>
+              <MessageRow
+                conv={conv}
+                m={it.m}
+                groupStart={it.groupStart}
+                pop={it.pop}
+                selfId={selfId}
+                chip={chipOf(it.m.authorDevice)}
+                receipt={receiptFor && receiptFor.id === it.m.id ? receiptFor.text : null}
+                isEditing={editingId === it.m.id}
+                getMessage={getMessage}
+                nameOf={nameOf}
+                onReply={onReply}
+                onEditStart={onEditStart}
+                onEditDone={onEditDone}
+              />
+              <EggSentinel id={it.m.id} onVisible={onEggVisible} />
+            </>
           )
       }
     },
-    [conv, selfId, chipOf, nameOf, getMessage, liveBoards, onReply, onEditStart, onEditDone, editingId, receiptFor],
+    [
+      conv,
+      selfId,
+      chipOf,
+      nameOf,
+      getMessage,
+      liveBoards,
+      onReply,
+      onEditStart,
+      onEditDone,
+      editingId,
+      receiptFor,
+      onEggVisible,
+    ],
   )
 
   if (!loaded && items.length === 0) return <SkeletonRows />

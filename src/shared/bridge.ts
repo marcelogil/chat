@@ -208,6 +208,10 @@ export interface SettingsView {
   suggestAtLaunch?: boolean
   /** 1.4 — set when the person clicked "Turn on notifications" (best effort: the OS prompt cannot be read back). */
   notificationsAccepted?: boolean
+  /** 1.5 — play the message easter eggs (a bug running across the window, confetti). Default on. */
+  easterEggs?: boolean
+  /** 1.5 — keep this device's presence green regardless of idle time or a locked screen (only offered to Gil). */
+  alwaysOnline?: boolean
   /**
    * 1.4 — pull-request alerts: every tracked pull request, only the ones
    * waiting on me (next actor, assigned, or mine), or none at all. Never
@@ -277,6 +281,8 @@ export type PushMessage =
   | { kind: 'board-ended'; sessionId: string }
   // Window fullscreen state (1.3), from enter/leave-full-screen.
   | { kind: 'fullscreen'; on: boolean }
+  // Team settings (1.5): the folded team name changed (an admin renamed it).
+  | { kind: 'team'; teamName: string }
   | { kind: 'presence'; views: PresenceView[] }
   // 1.4: this device's own row. `presence.views` is everyone *else* (main
   // filters the local device out of the roster), which is why the footer's
@@ -548,6 +554,12 @@ export interface BridgeApi {
 
   update: {
     copyToMachine(): Promise<{ path: string } | { error: string }>
+  }
+
+  /** Team-wide settings (1.5). Reading is the ordinary event path (TEAM_CONV.settings) plus the 'team' push. */
+  team: {
+    /** Publish a `team-renamed` sys event (admins only — rejects `not-admin`; 1–40 chars). Queued when the share is unreachable. */
+    rename(name: string): Promise<{ queued: boolean }>
   }
 
   /** Diagnostics (1.2). */

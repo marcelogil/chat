@@ -289,3 +289,25 @@ export function IconBellOff({ size }: IconProps) {
     </Svg>
   )
 }
+
+/** 1.5 — the pull-requests header's "N overdue"/"N stale" toggle, hidden state. */
+export function IconEyeOff({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M17.9 17.9A10.6 10.6 0 0 1 12 20c-6.5 0-10-7-10-7a19 19 0 0 1 4.7-5.6" />
+      <path d="M9.9 4.2A9.8 9.8 0 0 1 12 4c6.5 0 10 7 10 7a18.8 18.8 0 0 1-2.2 3.2" />
+      <path d="M14.1 14.1a3 3 0 1 1-4.2-4.2" />
+      <path d="M2 2l20 20" />
+    </Svg>
+  )
+}
+
+/** Rename affordance (1.5): the pencil beside a conversation's name. */
+export function IconPencil({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M4 20h4l10-10a2.1 2.1 0 0 0-3-3L5 17v3z" />
+      <path d="M14.5 6.5l3 3" />
+    </Svg>
+  )
+}

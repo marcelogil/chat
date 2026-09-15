@@ -67,6 +67,8 @@ export class BeaconWriter {
   private dirty = false
   private pendingTimer: NodeJS.Timeout | null = null
   private heartbeat: NodeJS.Timeout | null = null
+  /** The schedule `heartbeat` is actually running on; null when it is silent. */
+  private scheduled: { periodMs: number; jitter: boolean } | null = null
   private lastBumpAt = 0
   /** I/O tier (1.2): heartbeat cadence, `presence.idleSec`, and paused = silent. */
   private tier: IoTier = 'blurred'
@@ -99,6 +101,20 @@ export class BeaconWriter {
     private session: Session,
     /** Injected so tests (and the budget harness) don't need electron's app. */
     private getAppVersion: () => string = () => '',
+    /**
+     * Gil's always-online preference (1.5), pulled fresh on every heartbeat
+     * decision and every publish — the same seam chatService/prService use
+     * for settings elsewhere (`getSettings()` called at the point of
+     * decision, not pushed). Content therefore follows the setting on the
+     * very next beacon by itself; the *schedule* cannot, because a beacon
+     * that is not beating has no "next beacon" to re-decide on, so flipping
+     * the setting calls `syncHeartbeat()` (ChatService.onSettingsChanged) to
+     * re-evaluate it. `SettingsView.alwaysOnline` is otherwise unenforced —
+     * harmless if set by hand on some other device — because the gate that
+     * matters is which display name the Settings UI offers the toggle to
+     * (`isGil`, `@shared/gilMode`), not anything checked here.
+     */
+    private getAlwaysOnline: () => boolean = () => false,
   ) {
     this.seq = session.store.readSecretJson<number>('beacon-seq') ?? 0
   }
@@ -120,25 +136,80 @@ export class BeaconWriter {
     }
   }
 
-  /** Heartbeat period for the current tier; null while paused. */
-  private heartbeatMs(): number | null {
-    if (this.tier === 'paused') return null
-    return this.tier === 'idle' ? BEACON.idleHeartbeatMs : BEACON.heartbeatMs
+  /**
+   * The presence teammates are about to read: the truthful state with Gil's
+   * always-online override (1.5) applied. Everything that has to agree with
+   * the share reads presence through here — the beacon body itself, and this
+   * device's own footer/right-rail row (`ChatService.selfPresence`), which
+   * derives away/online from `idleSec` exactly the way a peer does. Reading
+   * the raw field there instead made Gil's own dot go amber after five idle
+   * minutes while every teammate saw him green: the one vantage point he has
+   * on the setting showed it not working.
+   */
+  get publishedPresence(): BeaconContent['presence'] {
+    return this.keepingGreen() ? { ...this.presence, state: 'online' as const, idleSec: 0 } : this.presence
+  }
+
+  /** Gil's always-online preference, with appear-offline outranking it. */
+  private keepingGreen(): boolean {
+    return this.getAlwaysOnline() && this.presence.state !== 'offline'
+  }
+
+  /**
+   * Heartbeat schedule for the current tier; null while paused — except for
+   * Gil, who keeps beating at the idle cadence through a locked screen so
+   * peers keep seeing green (1.5). Appear-offline still wins: if the presence
+   * itself says offline there is nothing left to keep looking online, so the
+   * paused device goes back to publishing its one goodbye and falling silent.
+   *
+   * That keep-green beat is the one schedule carrying no jitter. Jitter only
+   * ever pushes a period later (see below), and 45 s + up to 3 s against
+   * PRESENCE.onlineWithinMs (50 s) leaves a peer barely 2 s of slack before it
+   * paints a locked-but-green Gil "away" anyway — the poller measures age from
+   * the beacon's own `hlc`. A single device beating behind a lock screen has
+   * no team to spread against, and its phase is already randomized by the
+   * moment the screen locked, so it runs at exactly BEACON.idleHeartbeatMs and
+   * keeps the whole 5 s.
+   */
+  private heartbeatPlan(): { periodMs: number; jitter: boolean } | null {
+    if (this.tier === 'paused') {
+      return this.keepingGreen() ? { periodMs: BEACON.idleHeartbeatMs, jitter: false } : null
+    }
+    return { periodMs: this.tier === 'idle' ? BEACON.idleHeartbeatMs : BEACON.heartbeatMs, jitter: true }
   }
 
   private restartHeartbeat(): void {
     if (this.heartbeat) clearInterval(this.heartbeat)
     this.heartbeat = null
-    const period = this.heartbeatMs()
-    if (!this.started || period === null) return
+    this.scheduled = null
+    const plan = this.heartbeatPlan()
+    if (!this.started || !plan) return
+    this.scheduled = plan
     // Jitter spreads a team's writes apart; it must never pull the period in.
     // `Math.floor(Math.random() * 2 - 1)` only ever yielded -1 or 0, so every
     // client ran its beacon between 15% early and on time — a systematic
     // overshoot of the cadence the constants describe.
     this.heartbeat = setInterval(
       () => void this.bump('heartbeat'),
-      period + Math.floor(Math.random() * BEACON.heartbeatJitterMs),
+      plan.periodMs + (plan.jitter ? Math.floor(Math.random() * BEACON.heartbeatJitterMs) : 0),
     )
+  }
+
+  /**
+   * Re-evaluate the heartbeat against the tier, the presence and the
+   * always-online setting, restarting the interval only when the schedule it
+   * should run at actually changed — so a repeated tier report or a status
+   * edit never resets the phase (and never brings the next write forward).
+   *
+   * Public because two inputs move without a tier change: the setting itself
+   * (ChatService.onSettingsChanged) and appear-offline chosen while already
+   * paused, which used to leave a paused device beating forever.
+   */
+  syncHeartbeat(): void {
+    if (!this.started) return
+    const plan = this.heartbeatPlan()
+    if (plan?.periodMs === this.scheduled?.periodMs && plan?.jitter === this.scheduled?.jitter) return
+    this.restartHeartbeat()
   }
 
   /**
@@ -170,8 +241,11 @@ export class BeaconWriter {
     // write of its own — otherwise "still idle" would cost more traffic than
     // the idle tier saves.
     this.presence = { ...this.presence, state, idleSec: sec }
+    // The schedule depends on more than the tier name (appear-offline, the
+    // always-online setting), so re-evaluate it on every report; syncHeartbeat
+    // restarts nothing when the schedule is unchanged, which is the common case.
+    this.syncHeartbeat()
     if (!changed) return
-    this.restartHeartbeat()
     if (this.started) void this.bump('presence')
   }
 
@@ -268,6 +342,11 @@ export class BeaconWriter {
 
   setPresence(p: Partial<BeaconContent['presence']>): void {
     this.presence = { ...this.presence, ...p }
+    // Appear-offline outranks always-online, including when it is chosen after
+    // the screen is already locked: without this the keep-green heartbeat kept
+    // beating on a device that had just said goodbye, so a paused, deliberately
+    // invisible client went on writing to the share every 45 s forever.
+    this.syncHeartbeat()
     void this.bump('presence')
   }
 
@@ -359,12 +438,20 @@ export class BeaconWriter {
       else grpSealed[target.token] = sealed
     }
 
+    // Gil's always-online preference (1.5): forced at publish time rather than
+    // stored into `this.presence`, so the truthful idleSec/tier state is never
+    // lost underneath it — switching the setting back off just resumes
+    // publishing whatever the tier already says. Appear-offline still wins:
+    // `setPresence({ state: 'offline' })` is a deliberate choice to look
+    // offline, and nothing about wanting to look online should undo that.
+    const presence = this.publishedPresence
+
     const content: BeaconContent = {
       device: s.deviceId,
       name: s.displayName,
       seq: seq36,
       hlc: s.io.calibratedNow(),
-      presence: this.presence,
+      presence,
       typing: this.typing && this.typing.until > s.io.calibratedNow() ? this.typing : undefined,
       heads: Object.fromEntries(this.heads),
       // 1.3: heads of event types a 1.2 reader cannot parse. Absent unless we

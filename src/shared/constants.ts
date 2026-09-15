@@ -44,7 +44,26 @@ export const DIR = {
 export const TEAM_CONV = {
   calendar: 'team:calendar',
   prs: 'team:prs',
+  /** 1.5 — team-wide settings (today: the team name), LWW sys events. Admin-only to write; see TEAM_ADMIN_NAMES. */
+  settings: 'team:settings',
 } as const satisfies Record<string, ConvId>
+
+/**
+ * Display names allowed to change team-wide settings (1.5) — the admin rule,
+ * written down once.
+ *
+ * There is no server to hold an admin list and no way to add one: the share is
+ * a folder, and `protocol.json` is written once at team creation. So "admin" is
+ * a name, compared trimmed and case-insensitively (`isGil`, `@shared/gilMode`),
+ * and it is enforced in three places that all read this constant — the Settings
+ * → Admin panel is listed only for these names, `ChatService.renameTeam`
+ * refuses anyone else, and the fold in `services/teamSettings.ts` ignores a
+ * `team-renamed` event whose author is not one of them. The fold is the one
+ * that matters: it is what a hand-built event on the share runs into.
+ *
+ * Change the rule here and nowhere else.
+ */
+export const TEAM_ADMIN_NAMES = ['gil'] as const
 
 /** Team calendar presentation constants. */
 export const CALENDAR = {

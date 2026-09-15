@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import type { Attachment, ConvId, MsgPayload, PresenceView } from '@shared/types'
 import { materialize } from '@shared/merge'
 import { RETENTION } from '@shared/constants'
@@ -6,7 +6,8 @@ import { useStore, selfOf } from '@/store'
 import { safeThumbSrc } from '@/content/parse'
 import { Avatar, formatBytes, formatTime, IconButton } from '@/ui/atoms'
 import { SectionLabel, truncate } from './chrome'
-import { IconFile, IconLock, IconPin, IconX } from './icons'
+import { IconFile, IconLock, IconPencil, IconPin, IconX } from './icons'
+import { ConvRenameInput } from './ConvRename'
 import { useBeamTarget, BeamLabel } from './beam'
 import { openDm, useDmMap, useGroupMap } from './dm'
 import { groupMemberRows } from './groupMembers'
@@ -97,6 +98,11 @@ export default function RightRail({
   const channel = channels.find((c) => c.conv === conv)
   const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
+  // 1.5 — About's Rename button for a private group; dropped whenever the rail
+  // moves to another conversation, so the edit can't follow it across.
+  const [renamingConv, setRenamingConv] = useState<ConvId | null>(null)
+  const renamingGroup = !!group && renamingConv === conv
+  const setRenamingGroup = (on: boolean) => setRenamingConv(on ? conv : null)
 
   const { pinnedMsgs, files } = useMemo(() => {
     const log = materialize(events ?? [])
@@ -231,9 +237,24 @@ export default function RightRail({
             ) : group ? (
               <div>
                 <SectionLabel style={{ marginBottom: 6 }}>Group</SectionLabel>
-                <div style={{ fontSize: 13, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <IconLock size={13} /> {group.name}
-                </div>
+                {renamingGroup ? (
+                  // The same inline rename as the sidebar row and the header
+                  // (1.5) — any member may rename a private group.
+                  <ConvRenameInput
+                    conv={group.conv}
+                    kind="group"
+                    current={group.name}
+                    onDone={() => setRenamingGroup(false)}
+                    style={{ height: 28, fontSize: 13 }}
+                  />
+                ) : (
+                  <div style={{ fontSize: 13, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <IconLock size={13} /> <span style={{ ...truncate, minWidth: 0 }}>{group.name}</span>
+                    <IconButton label={`Rename ${group.name}`} size={22} onClick={() => setRenamingGroup(true)}>
+                      <IconPencil size={13} />
+                    </IconButton>
+                  </div>
+                )}
                 <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 4 }}>
                   {group.role === 'owner' ? 'You own this group. ' : ''}
                   Only {group.members.length} people can read it — invites travel as a direct message, so nobody else

@@ -85,6 +85,15 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:renameChannel', (_e, conv: ConvId, name: string) => chat().renameChannel(conv, name))
   ipcMain.handle('chat:deleteChannel', (_e, conv: ConvId) => chat().deleteChannel(conv))
 
+  // Team settings (1.5): a `team-renamed` sys event in TEAM_CONV.settings, the
+  // same shape as a channel rename. The renderer is sandboxed web code, so the
+  // name is re-normalized and re-validated inside renameTeam (1–40 chars after
+  // trimming) rather than trusted as it arrives; queueing is not a failure.
+  // `renameTeam` also throws `not-admin` for anyone but Gil, and that rejection
+  // travels to the renderer as-is — Settings → Admin turns it into a sentence
+  // (`teamRenameFailureNotice`).
+  ipcMain.handle('team:rename', (_e, name: string) => chat().renameTeam(typeof name === 'string' ? name : ''))
+
   // 1.4 — the launch nudge: OS facts LaunchNudge.tsx / SettingsModal need, plus
   // the two actions behind their "Turn on" buttons and toggles.
   ipcMain.handle('app:launchInfo', (): LaunchInfo => {

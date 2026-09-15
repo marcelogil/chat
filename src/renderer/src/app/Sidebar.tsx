@@ -22,6 +22,7 @@ import { openDm, useDmMap } from "./dm";
 import { countPreTombstonePeers } from "./outdatedPeers";
 import { peopleRows } from "./peopleRows";
 import { PersonLines } from "./PersonLines";
+import { convNameMax, planRename } from "./renamePlan";
 import { toast } from "./toasts";
 import QuickSwitcher from "./QuickSwitcher";
 import { ConfirmDialog, Dropdown, MenuItem, MenuNote } from "./ChannelMenu";
@@ -69,11 +70,19 @@ function ChannelRow({
   const showTrigger = hover || menuOpen;
 
   async function submitRename() {
-    const next = normalizeChannelName(renameValue);
+    // One rename decision for every surface (1.5): the row menu here, the
+    // conversation header and the right rail all go through planRename, so a
+    // change to the normalization or the home-channel refusal cannot reach two
+    // of the three and leave this one behind.
+    const plan = planRename({ kind: "channel", current: name, input: renameValue, fixed });
     setRenaming(false);
-    if (!next || next === name) return;
+    if (plan.action === "refuse") {
+      toast(plan.reason, "info");
+      return;
+    }
+    if (plan.action !== "rename") return;
     try {
-      await window.bridge.chat.renameChannel(conv, next);
+      await window.bridge.chat.renameChannel(conv, plan.name);
     } catch (err) {
       toast(
         `Could not rename #${name} — ${err instanceof Error ? err.message : String(err)}`,
@@ -692,11 +701,13 @@ function GroupRow({
   const showTrigger = hover || menuOpen;
 
   async function submitRename() {
-    const next = renameValue.trim().slice(0, 60);
+    // Same shared decision as the channel row above (renamePlan.ts) — the
+    // group cap lives there now, not as a `60` typed in three places.
+    const plan = planRename({ kind: "group", current: group.name, input: renameValue });
     setRenaming(false);
-    if (!next || next === group.name) return;
+    if (plan.action !== "rename") return;
     try {
-      await window.bridge.groups.rename(group.conv, next);
+      await window.bridge.groups.rename(group.conv, plan.name);
     } catch (err) {
       toast(
         `Could not rename the group — ${err instanceof Error ? err.message : String(err)}`,
@@ -740,7 +751,7 @@ function GroupRow({
           className="sem-input"
           style={{ height: 28, fontSize: 12 }}
           value={renameValue}
-          maxLength={60}
+          maxLength={convNameMax("group")}
           aria-label={`Rename ${group.name}`}
           onChange={(e) => setRenameValue(e.target.value)}
           onKeyDown={(e) => {
@@ -1100,6 +1111,10 @@ function TeamBlock() {
       }}
     >
       <span
+        // The name can be renamed by any member now (1.5) and this row
+        // truncates, so it carries its own tooltip — and gives the E2E script
+        // something exact to look for.
+        title={self?.teamName ?? "Chat"}
         style={{
           ...truncate,
           fontSize: 15,
