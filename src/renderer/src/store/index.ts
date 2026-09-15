@@ -19,6 +19,7 @@ import { TEAM_CONV } from '@shared/constants'
 import { toast } from '@/app/toasts'
 import type { DiagramEditorState } from '@/diagram/state'
 import { endBoardIn, foldBoardEvents, type LiveBoardMap } from '@/diagram/live'
+import type { PendingJump } from '@/search/jump'
 import { findGroupRemovedEvent, resolveActiveConvVanish } from './convVanish'
 import { noteLiveEvent, resetLiveEvents } from './liveEvents'
 import { teamRenameNotice } from './teamRename'
@@ -124,6 +125,12 @@ interface ChatStore {
    * is what puts a **Join** button on a sys row and takes it away again.
    */
   liveBoards: LiveBoardMap
+  /**
+   * A "take me to that message" request from the quick switcher's message
+   * search (1.6): set with the conversation, consumed by that conversation's
+   * MessageList once its log is in, then cleared. Rules in search/jump.ts.
+   */
+  pendingJump: PendingJump | null
   /** Tracked Azure DevOps pull requests (pushed by the main-side PR service). */
   prs: PrView[]
   prsStatus: PrsStatus | null
@@ -144,6 +151,14 @@ interface ChatStore {
   /** Navigate to the PR group and open (or close) its settings dialog. */
   setPrsPrefsOpen(open: boolean): void
   ensureEvents(conv: ConvId): Promise<void>
+  /**
+   * Open a conversation and scroll to one message in it (1.6). The log is
+   * pulled first — the request is only worth anything to a MessageList that
+   * can already see whether the message is there.
+   */
+  jumpToMessage(conv: ConvId, id: string): Promise<void>
+  /** The jump has been acted on (scrolled to, or reported missing). */
+  clearPendingJump(): void
   /** Resolves with the new event's id — a live board's `end` records the snapshot it finished on. */
   send(conv: ConvId, draft: SendDraft): Promise<{ id: string }>
   markRead(conv: ConvId, stem: string): void
@@ -261,6 +276,7 @@ export const useStore = create<ChatStore>((set, get) => ({
   diagramEditor: null,
   fullscreen: false,
   liveBoards: {},
+  pendingJump: null,
   prs: [],
   prsStatus: null,
   prsPrefsOpen: false,
@@ -303,6 +319,7 @@ export const useStore = create<ChatStore>((set, get) => ({
               lightbox: null,
               diagramEditor: null,
               liveBoards: {},
+              pendingJump: null,
               outboxQueued: 0,
               prs: [],
               prsStatus: null,
@@ -539,6 +556,20 @@ export const useStore = create<ChatStore>((set, get) => ({
     const cursors = await window.bridge.chat.cursors(conv)
     if (get().teamSeq !== teamSeqAtStart) return
     set((s) => ({ cursors: { ...s.cursors, [conv]: cursors } }))
+  },
+
+  async jumpToMessage(conv, id) {
+    // Order matters: the field is set *before* the conversation switches, so a
+    // MessageList that is already mounted on `conv` (searching from inside the
+    // conversation you are reading) sees the request on the same render the
+    // switch would otherwise have been the only trigger for.
+    set({ pendingJump: { conv, id } })
+    get().setActiveConv(conv)
+    await get().ensureEvents(conv)
+  },
+
+  clearPendingJump() {
+    set({ pendingJump: null })
   },
 
   async send(conv, draft) {

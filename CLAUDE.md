@@ -590,3 +590,39 @@ Once per calendar day, per **team folder** — keyed in `localStorage` as
 (`src/renderer/src/team/CalendarDigest.tsx`). Priority is birthday > an event
 covering today > a countdown; opening the calendar pane suppresses the toast
 without spending the day's attempt.
+
+## Message search (1.6)
+
+Entirely renderer-only — `src/shared/bridge.ts`, `src/preload/index.ts`,
+`src/main/**` and the share are untouched. The quick switcher's ⌘K box
+searches inside every log `loadTeam()` already prefetched for the unread
+badges (`store.events`), so a search is a pure in-memory fold, not a new
+read: zero share I/O, invisible to every other client, and reaches only
+what this device can already decrypt.
+
+- **Where the pure modules live.** `src/renderer/src/search/messageSearch.ts`
+  (folding with an offset map so a `<mark>` never lands off by one character,
+  tokenizing, whole-word/prefix AND matching, the global newest-200 cap
+  applied *before* grouping, the snippet) and
+  `src/renderer/src/search/jump.ts` (the `pendingJump` state machine). Both
+  are pure — no React, no DOM, no bridge — and unit-tested without mounting
+  anything.
+- **The `pendingJump` handshake with `MessageList`.** The quick switcher
+  can't scroll a list that isn't mounted yet; `store.jumpToMessage(conv, id)`
+  sets `pendingJump` *before* switching `activeConv`, so jumping from inside
+  the conversation you're already reading still fires. `MessageList` is the
+  only consumer: `resolveJump` (`search/jump.ts`) yields `none`/`wait`/
+  `scroll`/`missing` — `wait` (log not loaded yet) deliberately does **not**
+  clear the request, or the first jump into a never-opened conversation would
+  race the log and misfire as `missing`. `scroll` highlights the row
+  (`data-jump-target="1"` on `MessageRow`, `sem-jump-flash` in
+  `chat/util.ts`'s `CHAT_CSS`, `JUMP_FLASH_MS` = 2 s) and scrolls to it one
+  animation frame later (virtuoso needs to lay the rows out first). `missing`
+  — the row was swept by retention before anyone searched for it — toasts
+  "That message is no longer on the share" instead of failing silently.
+  `pendingJump` is cleared on a team-folder change like every other
+  team-scoped slice.
+- **Search never touches the share.** No new event type, no new bridge
+  surface, no new IPC handler, no `protocol.json` change — an older client
+  is unaffected by construction, since nothing about this feature is on the
+  wire for it to see. Full design: `docs/features-1.6.md`.

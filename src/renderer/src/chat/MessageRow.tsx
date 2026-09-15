@@ -22,6 +22,8 @@ interface Props {
   m: MessageView
   groupStart: boolean
   pop: boolean
+  /** 1.6 — a quick-switcher jump landed here: highlight the row while it lasts. */
+  flash?: boolean
   selfId: string
   chip: ChipData
   receipt: string | null
@@ -38,6 +40,7 @@ export const MessageRow = memo(function MessageRow({
   m,
   groupStart,
   pop,
+  flash = false,
   selfId,
   chip,
   receipt,
@@ -69,7 +72,13 @@ export const MessageRow = memo(function MessageRow({
 
   return (
     <div
-      className={pop ? 'sem-row sem-pop' : 'sem-row'}
+      className={`sem-row${pop ? ' sem-pop' : ''}${flash ? ' sem-jump-flash' : ''}`}
+      // The attribute is the highlight's whole contract: the CSS paints on it,
+      // and the E2E drive looks for it to prove a jump actually landed — in the
+      // right conversation, which is what `data-conv` is doing here (only the
+      // active conversation's rows are ever in the DOM).
+      data-jump-target={flash ? '1' : undefined}
+      data-conv={conv}
       style={{ display: 'flex', gap: 12, padding: `${groupStart ? 12 : 2}px 16px 2px 16px` }}
     >
       {/* Gutter: avatar for group starts, hover timestamp for follow-ups */}

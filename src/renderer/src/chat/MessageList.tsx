@@ -5,6 +5,8 @@ import type { ConvId } from '@shared/types'
 import { isDmConv } from '@shared/ids'
 import type { MaterializedLog, MessageView, SysView } from '@shared/merge'
 import { useStore } from '@/store'
+import { toast } from '@/app/toasts'
+import { JUMP_FLASH_MS, isDuplicateInvocation, resolveJump, shouldClear, type PendingJump } from '@/search/jump'
 import { formatDayDivider, formatTime } from '@/ui/atoms'
 import { openLiveBoard } from '@/diagram/collab'
 import { boardJoinAction, type LiveBoardEntry } from '@/diagram/live'
@@ -56,6 +58,8 @@ export function MessageList({
   onEditDone,
 }: Props) {
   const virtuosoRef = useRef<VirtuosoHandle>(null)
+  /** The row a quick-switcher jump landed on, highlighted for JUMP_FLASH_MS. */
+  const [flashId, setFlashId] = useState<string | null>(null)
   const seenRef = useRef<Set<string>>(new Set())
   const initializedRef = useRef(false)
   const [atBottom, setAtBottom] = useState(true)
@@ -139,6 +143,57 @@ export function MessageList({
     return { id: mineNewest.id, text: 'Sent' }
   }, [conv, cursors, log, selfId])
 
+  // Jump to one message (1.6): the quick switcher's message search sets
+  // `pendingJump` and this is the only place that can act on it — the row index
+  // exists nowhere else, and neither does the virtuoso handle. Rules (whose
+  // list, loaded yet, still there at all) live in search/jump.ts.
+  const pendingJump = useStore((s) => s.pendingJump)
+  /**
+   * The exact `pendingJump` object this effect has already resolved — guards
+   * against React.StrictMode invoking the effect body twice for one commit
+   * (isDuplicateInvocation, search/jump.ts). Without it, a retention-miss
+   * toast (or a scroll) could fire twice for a single jump.
+   */
+  const lastHandledJumpRef = useRef<PendingJump | null>(null)
+  useEffect(() => {
+    if (isDuplicateInvocation(pendingJump, lastHandledJumpRef.current)) return
+    // Resolve against the store's live value rather than trust the closed-over
+    // `pendingJump`: this effect's side effects must reflect the request as it
+    // stands right now, not as it stood when this render was scheduled.
+    const current = useStore.getState().pendingJump
+    const action = resolveJump(current, {
+      conv,
+      loaded,
+      indexOf: (id) => items.findIndex((it) => it.kind === 'msg' && it.m.id === id),
+    })
+    if (shouldClear(action)) {
+      lastHandledJumpRef.current = current
+      useStore.getState().clearPendingJump()
+    }
+    if (action.kind === 'scroll') {
+      const index = action.index
+      setFlashId(action.id)
+      // A frame later: virtuoso measures the rows it has just been handed, and
+      // scrolling into a list that has not laid out yet lands short.
+      //
+      // Deliberately *not* cancelled on cleanup: clearing the request one line
+      // above re-runs this effect before the frame arrives, and a cleanup that
+      // cancelled it would cancel the very scroll it had just asked for. After
+      // an unmount the ref is null and the callback does nothing.
+      window.requestAnimationFrame(() => {
+        virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' })
+      })
+    } else if (action.kind === 'missing') {
+      toast(action.toast, 'info')
+    }
+  }, [pendingJump, conv, loaded, items])
+
+  useEffect(() => {
+    if (flashId === null) return undefined
+    const t = window.setTimeout(() => setFlashId(null), JUMP_FLASH_MS)
+    return () => window.clearTimeout(t)
+  }, [flashId])
+
   // Mark read while parked at the bottom with app focus.
   useEffect(() => {
     if (!newestId) return
@@ -191,6 +246,7 @@ export function MessageList({
                 m={it.m}
                 groupStart={it.groupStart}
                 pop={it.pop}
+                flash={flashId === it.m.id}
                 selfId={selfId}
                 chip={chipOf(it.m.authorDevice)}
                 receipt={receiptFor && receiptFor.id === it.m.id ? receiptFor.text : null}
@@ -219,6 +275,7 @@ export function MessageList({
       editingId,
       receiptFor,
       onEggVisible,
+      flashId,
     ],
   )
 

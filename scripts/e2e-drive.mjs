@@ -2796,6 +2796,200 @@ async function main() {
        })()`,
     )
 
+    // ---- Message search in the quick switcher (1.6) ------------------------
+    // The box searches inside every log this client holds, not just the names
+    // of the conversations: two words from a message Alice wrote at the top of
+    // this run have to find it, say which conversation it is in, and take Bob
+    // to it. Driven through the real input with the same native-setter + input
+    // event the (previous device) check above uses — React never sees a raw
+    // `.value =` — and read back off the attributes the rows carry for exactly
+    // this purpose (data-search-section / data-search-conv / data-search-hit).
+    const typeInSwitcher = (cdp, text) =>
+      cdp.eval(
+        `(() => {
+           const i = document.querySelector('input[aria-label^="Quick switcher"]')
+           if (!i) return false
+           i.focus()
+           i.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+           i.dispatchEvent(new FocusEvent('focus'))
+           const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+           set.call(i, ${JSON.stringify(text)})
+           i.dispatchEvent(new Event('input', { bubbles: true }))
+           return true
+         })()`,
+      )
+    const readSearch = (cdp) =>
+      cdp.eval(
+        `(() => {
+           const hits = Array.from(document.querySelectorAll('[data-search-hit="1"]'))
+           return {
+             section: !!document.querySelector('[data-search-section="messages"]'),
+             headers: Array.from(document.querySelectorAll('[data-search-conv]')).map((n) => ({
+               conv: n.getAttribute('data-search-conv'),
+               text: n.textContent,
+             })),
+             hits: hits.map((n) => ({
+               conv: n.getAttribute('data-conv'),
+               index: Number(n.getAttribute('data-row-index')),
+               marks: n.querySelectorAll('mark').length,
+               html: n.innerHTML,
+               text: n.textContent,
+             })),
+           }
+         })()`,
+      )
+    const clearSwitcher = (cdp) =>
+      cdp.eval(
+        `(() => {
+           const i = document.querySelector('input[aria-label^="Quick switcher"]')
+           if (!i) return false
+           const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+           set.call(i, '')
+           i.dispatchEvent(new Event('input', { bubbles: true }))
+           i.blur()
+           return true
+         })()`,
+      )
+
+    await typeInSwitcher(bob, 'hello alice')
+    const msgSearch = await until(async () => {
+      const r = await readSearch(bob)
+      return r && r.section && r.hits.some((h) => h.conv === conv) ? r : undefined
+    }, 20000)
+    check(
+      "two words from alice's first channel message find it from bob's ⌘K box",
+      !!msgSearch,
+      msgSearch ? `${msgSearch.hits.length} hit(s)` : 'no Messages section for "hello alice"',
+    )
+    const generalHit = msgSearch?.hits.find((h) => h.conv === conv)
+    check(
+      'the hit sits under its channel header with the matched words marked',
+      !!generalHit &&
+        generalHit.marks >= 2 &&
+        /<mark[ >]/.test(generalHit.html) &&
+        (msgSearch?.headers ?? []).some((h) => h.conv === conv && h.text.includes('general')),
+      generalHit
+        ? `${generalHit.marks} <mark>s in ${JSON.stringify(generalHit.text)}`
+        : JSON.stringify(msgSearch?.headers ?? []),
+    )
+    // ↓ has to walk out of the conversation rows and into the message hits —
+    // but "hello alice" fuzzy-matches no channel/person/group row (nothing in
+    // any of those names is a subsequence of that two-word string), so the
+    // first — and only — result row is already the message hit, and the test
+    // used to prove nothing: `want` came out 0, zero ArrowDowns were
+    // dispatched, and the initial selection already sat on the hit.
+    //
+    // "alice" alone fixes that: it fuzzy-matches the peer row Alice ⌘K also
+    // lists (an `item`), *and* still finds the word "alice" in her channel
+    // message, so there is a real row above the hit to walk down through.
+    await typeInSwitcher(bob, 'alice')
+    const aliceSearch = await until(async () => {
+      const r = await readSearch(bob)
+      return r && r.hits.some((h) => h.conv === conv) ? r : undefined
+    }, 20000)
+    check(
+      '"alice" alone still finds both the peer row and her channel message',
+      !!aliceSearch,
+      aliceSearch ? `${aliceSearch.hits.length} hit(s)` : 'no hits for "alice"',
+    )
+    // Soft: this dispatches synthetic keydowns, and a real pointer resting
+    // over the dropdown would steal the selection back (rows select on
+    // hover) — a race the feature does not own. What it does *not* do any
+    // more is read the selection synchronously: the handler is a React state
+    // update, painted a tick after the event, so the old one-shot read always
+    // saw the pre-keydown selection and reported "did not move".
+    const arrowSent = await bob.eval(
+      `(() => {
+         const i = document.querySelector('input[aria-label^="Quick switcher"]')
+         const first = document.querySelector('[data-search-hit="1"]')
+         if (!i || !first) return { want: 0, before: -1 }
+         const want = Number(first.getAttribute('data-row-index'))
+         const sel = document.querySelector('[role="option"][aria-selected="true"]')
+         const before = sel ? Number(sel.getAttribute('data-row-index')) : -1
+         for (let n = 0; n < want - Math.max(before, 0); n++)
+           i.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+         return { want, before }
+       })()`,
+    )
+    const arrowLanded =
+      arrowSent.want > 0
+        ? await until(async () => {
+            const r = await bob.eval(
+              `(() => {
+                 const sel = document.querySelector('[role="option"][aria-selected="true"]')
+                 if (!sel) return { index: -1, kind: 'none' }
+                 return {
+                   index: Number(sel.getAttribute('data-row-index')),
+                   kind: sel.getAttribute('data-search-hit') === '1' ? 'hit' : 'item',
+                 }
+               })()`,
+            )
+            return r && r.kind === 'hit' && r.index === arrowSent.want ? r : undefined
+          }, 5000)
+        : undefined
+    soft(
+      '↓ moves the selection through the Messages section too',
+      !!arrowLanded,
+      JSON.stringify({ ...arrowSent, landed: arrowLanded ?? null }),
+    )
+    // The row's handler is onMouseDown (mousedown fires before the input's
+    // blur closes the list), so `.click()` would land on nothing.
+    const hitPressed = await bob.eval(
+      `(() => {
+         const row = document.querySelector('[data-search-hit="1"][data-conv=${JSON.stringify(conv)}]')
+         if (!row) return false
+         row.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+         return true
+       })()`,
+    )
+    check('bob presses the message hit', hitPressed === true)
+    const jumped = await until(
+      async () => {
+        const row = await bob.eval(
+          `(() => {
+             const el = document.querySelector('[data-jump-target="1"]')
+             return el ? { conv: el.getAttribute('data-conv'), text: el.textContent } : null
+           })()`,
+        )
+        return row ?? undefined
+      },
+      5000,
+      200,
+    )
+    check(
+      'the hit opens that conversation and flashes the message row it pointed at',
+      !!jumped && jumped.conv === conv && /hello from alice/.test(jumped.text ?? ''),
+      jumped
+        ? `${jumped.conv} — ${JSON.stringify((jumped.text ?? '').slice(0, 60))}`
+        : 'no [data-jump-target="1"] row within 5s',
+    )
+
+    // A word that exists only inside a private group finds the group — the
+    // search reaches everything this client can decrypt, and nothing else.
+    await typeInSwitcher(bob, 'hi duo')
+    const grpSearch = await until(async () => {
+      const r = await readSearch(bob)
+      return r && r.hits.some((h) => h.conv === group?.conv) ? r : undefined
+    }, 20000)
+    check(
+      'a phrase only ever written in the private group finds the group',
+      !!grpSearch &&
+        (grpSearch.headers ?? []).some((h) => h.conv === group?.conv && h.text.includes('Duo')),
+      grpSearch
+        ? JSON.stringify(grpSearch.hits.map((h) => `${h.conv}: ${h.text}`))
+        : 'no grp: hit for "hi duo"',
+    )
+
+    await typeInSwitcher(bob, 'zzzqqq')
+    await sleep(700)
+    const noSearch = await readSearch(bob)
+    check(
+      'a word nobody ever wrote shows no Messages section at all',
+      noSearch?.section === false && (noSearch?.hits.length ?? 0) === 0,
+      JSON.stringify(noSearch?.hits.map((h) => h.text) ?? []),
+    )
+    await clearSwitcher(bob)
+
     await alice2.screenshot(join(SHOTS, 'e2e-rejoin.png')).catch(() => {})
     soft('re-joined sidebar screenshot', true, join(SHOTS, 'e2e-rejoin.png'))
 

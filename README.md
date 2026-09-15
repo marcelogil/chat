@@ -96,6 +96,10 @@ the only thing every machine can reach is an SMB share.
   French, German/Swiss German or Portuguese; strictly reader-side (nothing
   rides the wire), once per message, and off entirely when the OS asks for
   reduced motion. Toggle it in Settings → Appearance.
+- **Message search** — the ⌘K/Ctrl-K quick switcher searches inside every
+  channel, DM and private group this device can already read, not just
+  their names, and jumps straight to the exact message, scrolled into view
+  and briefly highlighted.
 
 ## How messages are secured (even from someone with the passphrase)
 

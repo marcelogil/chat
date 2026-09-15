@@ -331,6 +331,14 @@ export const CHAT_CSS = `
 .sem-gutter-ts { opacity: 0; }
 .sem-row:hover .sem-gutter-ts { opacity: 1; }
 .sem-selectable, .sem-selectable * { user-select: text; }
+/* 1.6 — the row a quick-switcher jump landed on. The attribute is what the
+   E2E drive asserts on; the class is here so the selector reads as a state. */
+@keyframes sem-jump-flash { from { background: var(--accent-soft); } to { background: transparent; } }
+.sem-row.sem-jump-flash[data-jump-target='1'] {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+  animation: sem-jump-flash 2s var(--ease-standard) forwards;
+}
 .sem-composer { border: 1px solid var(--border-subtle); transition: border-color var(--t-fast) var(--ease-standard); }
 .sem-composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); }
 .sem-jump { animation: sem-rise-center 200ms var(--ease-glide); }
