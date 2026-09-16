@@ -448,7 +448,10 @@ Icons to add in `src/renderer/src/app/icons.tsx` (24-grid, stroke 1.7):
 
 - `resources/splash.html`: self-contained (inline CSS, no script), dark
   `#0E0F13` background, `<img src="icon.png">` (the existing
-  `resources/icon.png`, 128px, rounded 28px, soft glow), wordmark "Chat"
+  `resources/icon.png`; since 1.6 the PNG carries its own squircle silhouette,
+  so the box is 140px with no `border-radius`, and the depth is a `drop-shadow`
+  chain that follows the artwork's alpha — hairline rim, cast shadow, glow),
+  wordmark "Chat"
   (600 weight, 28px, `-apple-system, "Segoe UI", system-ui`), a subtle
   "Encrypted team chat" line, a 3-dot pulsing loader, and an empty
   `<div id="v"></div>` for the version. CSP meta:

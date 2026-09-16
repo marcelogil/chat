@@ -44,35 +44,52 @@
         cursor: default;
       }
 
-      /* A very soft indigo wash behind the mark so the dark icon has a ground
-         to sit on rather than dissolving into the #0E0F13 canvas. */
+      /* A soft indigo pool behind the mark so the dark icon has a ground to sit
+         on rather than dissolving into the #0E0F13 canvas. It has to be a pool
+         and not a wide wash: the icon tile's own gradient ENDS on #0E0F13 —
+         byte-identical to this background — so without a local lift the
+         bottom-right of the squircle has no boundary at all. Centred on the
+         mark (150 - 89 = 61px above the window centre, hence the -61 - 230/2
+         top margin), and kept tight enough that the lift is under the tile
+         instead of spread across the window. */
       .glow {
         position: absolute;
         top: 50%;
         left: 50%;
-        width: 340px;
-        height: 340px;
-        margin: -222px 0 0 -170px;
+        width: 230px;
+        height: 230px;
+        margin: -176px 0 0 -115px;
         border-radius: 50%;
         background: radial-gradient(
           circle,
-          rgba(123, 128, 255, 0.18) 0%,
-          rgba(123, 128, 255, 0.07) 42%,
-          rgba(123, 128, 255, 0) 70%
+          rgba(123, 128, 255, 0.3) 0%,
+          rgba(123, 128, 255, 0.16) 45%,
+          rgba(123, 128, 255, 0) 72%
         );
         pointer-events: none;
       }
 
+      /* The mark IS the app icon (resources/icon.png): the PNG carries its own
+         squircle silhouette and a transparent margin around it, so the depth
+         has to follow the artwork's alpha. A box-shadow would trace the <img>
+         box instead — a rounded rectangle floating a dozen pixels outside the
+         tile, hairline included.
+         140px, not 128: the artwork reserves the macOS HIG margin (the tile is
+         824/1024 = 0.81 of the canvas, where the pre-1.6 drawing was 0.88), so
+         140 x 0.81 puts the visible tile back at ~113px.
+         The first drop-shadow is a hairline light rim. It replaces the
+         `inset 0 0 0 1px rgba(255,255,255,0.06)` the old box-shadow drew, and
+         it has to be a drop-shadow because only that follows the PNG's alpha;
+         without it the tile's dark wash and this canvas are the same colour
+         and the silhouette has no edge to read. */
       .mark {
         position: relative;
-        width: 128px;
-        height: 128px;
-        border-radius: 28px;
+        width: 140px;
+        height: 140px;
         display: block;
-        box-shadow:
-          0 18px 44px rgba(0, 0, 0, 0.55),
-          0 0 34px rgba(123, 128, 255, 0.22),
-          inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+        filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.35))
+          drop-shadow(0 14px 30px rgba(0, 0, 0, 0.55))
+          drop-shadow(0 0 18px rgba(123, 128, 255, 0.22));
       }
 
       .wordmark {
@@ -154,7 +171,7 @@
   </head>
   <body>
     <div class="glow"></div>
-    <img class="mark" src="icon.png" alt="" width="128" height="128" />
+    <img class="mark" src="icon.png" alt="" width="140" height="140" />
     <div class="wordmark">Chat</div>
     <div class="tagline">Encrypted team chat</div>
     <div class="dots" role="presentation"><i></i><i></i><i></i></div>

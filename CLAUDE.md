@@ -121,6 +121,41 @@ Files over 1.2 MB are skipped — they render at ~160px. The renderer loads them
 over the `sfgif://pack/<id>.gif` protocol (`src/main/services/gifProtocol.ts`);
 a pack GIF is sent as its `packId`, so it costs zero shared-folder I/O.
 
+## App icon
+
+Source of truth: **`build/icon-source.png`** (the blue speech bubble, committed
+as supplied). `node scripts/make-icons.mjs` regenerates `build/icon.icns`,
+`build/icon.ico` and `resources/icon.png` (512 — the splash window, the README
+and the E2E's upload fixture all read that one) from it; two runs produce
+byte-identical files. Replace the icon by replacing the source PNG and
+re-running — never by hand-editing an output.
+
+macOS-only, by the same contract `iconutil` already imposed: `sips` decodes the
+PNG to a BMP the script parses itself. **No image dependency, ever** — that is
+the iron rule, not a convenience. The tile behind the mark is still drawn in
+code (superellipse spanning 824/1024, dark `#20232C → #0E0F13` wash, blurred
+drop shadow); the bubble is keyed out of the source and scaled to 0.62 of the
+canvas wide, centred.
+
+The keying subtlety: **the three dots inside the bubble are white, and so is
+the background.** Anything shaped like "make white transparent" punches holes
+through them. The script flood-fills the background inward from the border
+instead, dilates that region ~3 px to catch the anti-aliased edge, and derives
+alpha (plus an un-premultiplied colour, so the edge gets no pale halo) only
+inside it. Pixels the fill never reaches — the dots — are left fully opaque.
+
+Verify the 16/32 @1x frames from `build/icon.ico`, never from an `iconutil -c
+iconset` round-trip: iconutil divides the edge colour by alpha on decode, which
+fakes a light halo the `.icns` does not contain (those two frames are stored as
+`ic04`/`ic05` straight ARGB and are byte-correct — 46/256 px at 16 and 100/1024
+at 32 come back different, all of them partially transparent edge pixels).
+Don't "fix" the downscale over it; it is arithmetically right.
+
+The tile's wash ends on `#0E0F13`, which is also `resources/splash.html`'s
+canvas colour — so on the splash the mark needs its own ground (the tightened
+`.glow` pool plus the hairline `drop-shadow` rim on `.mark`, both commented
+there). Changing either end of that wash means re-checking the splash.
+
 ## Team conversations (1.1)
 
 `team:` is a third `ConvId` kind alongside `chan:`/`dm:` (guards in
